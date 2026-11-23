@@ -601,7 +601,34 @@ impl GpuCompositor {
         render_multiview: bool,
         need_nv12_readback: bool,
     ) -> Option<&[u8]> {
-        self.upload_dirty_sources(collection, source_frames);
+        let program = collection.resolve_render_items(collection.active_scene_id);
+        let preview = studio_mode.then(|| {
+            collection.resolve_render_items(
+                collection
+                    .preview_scene_id
+                    .unwrap_or(collection.active_scene_id),
+            )
+        });
+        let transition_items = active_transition.map(|tr| {
+            (
+                collection.resolve_render_items(tr.from_scene),
+                collection.resolve_render_items(tr.to_scene),
+            )
+        });
+        let visible_sources = (!render_multiview).then(|| {
+            let (from, to) = transition_items
+                .as_ref()
+                .map(|(from, to)| (from.as_slice(), to.as_slice()))
+                .unwrap_or_default();
+            program
+                .iter()
+                .chain(preview.iter().flatten())
+                .chain(from)
+                .chain(to)
+                .map(|item| item.source_id)
+                .collect()
+        });
+        self.upload_dirty_sources(collection, source_frames, visible_sources.as_ref());
 
         let mut encoder = self
             .device
@@ -611,23 +638,17 @@ impl GpuCompositor {
 
         // 1. Render Program (with active transition if running)
         if let Some(tr) = active_transition {
-            let from_items = collection.resolve_render_items(tr.from_scene);
-            let to_items = collection.resolve_render_items(tr.to_scene);
-            self.render_items_into(&mut encoder, TargetSlot::TransitionFrom, &from_items);
-            self.render_items_into(&mut encoder, TargetSlot::TransitionTo, &to_items);
+            let (from_items, to_items) = transition_items.as_ref().unwrap();
+            self.render_items_into(&mut encoder, TargetSlot::TransitionFrom, from_items);
+            self.render_items_into(&mut encoder, TargetSlot::TransitionTo, to_items);
             self.render_transition(&mut encoder, tr);
         } else {
-            let prog_items = collection.resolve_render_items(collection.active_scene_id);
-            self.render_items_into(&mut encoder, TargetSlot::Program, &prog_items);
+            self.render_items_into(&mut encoder, TargetSlot::Program, &program);
         }
 
         // 2. Render Preview (if Studio Mode)
-        if studio_mode {
-            let prev_id = collection
-                .preview_scene_id
-                .unwrap_or(collection.active_scene_id);
-            let prev_items = collection.resolve_render_items(prev_id);
-            self.render_items_into(&mut encoder, TargetSlot::Preview, &prev_items);
+        if let Some(items) = preview {
+            self.render_items_into(&mut encoder, TargetSlot::Preview, &items);
         }
 
         // 3. Render Multiview (2 top Preview/Program + up to 8 scenes bottom)
@@ -762,12 +783,16 @@ impl GpuCompositor {
         &self,
         collection: &SceneCollection,
         source_frames: &HashMap<SourceId, VideoFrame>,
+        visible_sources: Option<&std::collections::HashSet<SourceId>>,
     ) {
         let now = Instant::now();
         let mut tex_map = self.source_textures.lock();
         tex_map.retain(|id, _| collection.sources.contains_key(id));
 
         for (id, frame) in source_frames {
+            if visible_sources.is_some_and(|visible| !visible.contains(id)) {
+                continue;
+            }
             // Check if source has RenderDelay or PluginVideoFilter
             let mut effective_frame = frame.clone();
             if let Some(src) = collection.sources.get(id) {

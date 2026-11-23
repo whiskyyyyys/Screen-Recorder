@@ -848,6 +848,7 @@ enum TransformOp {
 
 impl eframe::App for ObsDesktopApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let frame_start = std::time::Instant::now();
         // Re-apply theme only if changed
         let settings = self.backend.settings();
         let desired_theme = if settings.accessibility.high_contrast {
@@ -955,7 +956,9 @@ impl eframe::App for ObsDesktopApp {
         self.render_inline_prompt(ctx);
         self.render_remove_dialog(ctx);
 
-        ctx.request_repaint();
+        let preview_fps = settings.video.config.fps_f64().clamp(24.0, 60.0);
+        let interval = std::time::Duration::from_secs_f64(1.0 / preview_fps);
+        ctx.request_repaint_after(interval.saturating_sub(frame_start.elapsed()));
     }
 
     fn on_exit(&mut self) {
@@ -1000,32 +1003,55 @@ impl<'a> ObsTabViewer<'a> {
         let studio = self.app.backend.studio_mode();
         let avail = ui.available_size();
         if studio {
-            ui.horizontal(|ui| {
-                let panel_w = ((avail.x - 95.0) * 0.5).max(160.0);
-                let panel_h = (avail.y - 28.0).max(120.0);
-                ui.vertical(|ui| {
-                    ui.set_width(panel_w);
-                    ui.centered_and_justified(|ui| {
-                        ui.colored_label(Color32::from_rgb(70, 215, 110), "PREVIEW");
-                    });
-                    if let Some(prev_id) = self.app.prev_tex_id {
-                        self.draw_interactive_canvas(
-                            ui,
-                            prev_id,
-                            Vec2::new(panel_w, panel_h),
-                            true,
-                        );
-                    }
-                });
+            let (rect, _) = ui.allocate_exact_size(avail, Sense::hover());
+            let gap = ui.spacing().item_spacing.x;
+            let transition_width = 88.0_f32.min(rect.width() / 3.0);
+            let panel_width = ((rect.width() - transition_width - 2.0 * gap) / 2.0).max(1.0);
+            let preview_rect = Rect::from_min_size(rect.min, Vec2::new(panel_width, rect.height()));
+            let program_rect = Rect::from_min_size(
+                Pos2::new(rect.right() - panel_width, rect.top()),
+                preview_rect.size(),
+            );
+            let controls_rect = Rect::from_min_max(
+                Pos2::new(preview_rect.right() + gap, rect.top()),
+                Pos2::new(program_rect.left() - gap, rect.bottom()),
+            );
 
-                // Center T-Bar & Transition button
-                ui.vertical_centered(|ui| {
-                    ui.set_width(80.0);
+            for (panel, title, texture, interactive) in [
+                (preview_rect, "Preview", self.app.prev_tex_id, true),
+                (program_rect, "Program", self.app.prog_tex_id, false),
+            ] {
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .id_salt(title)
+                        .max_rect(panel)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                    |ui| {
+                        ui.set_clip_rect(ui.clip_rect().intersect(panel));
+                        ui.label(title);
+                        if let Some(texture) = texture {
+                            self.draw_interactive_canvas(
+                                ui,
+                                texture,
+                                ui.available_size(),
+                                interactive,
+                            );
+                        }
+                    },
+                );
+            }
+
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .id_salt("studio_transition")
+                    .max_rect(controls_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Center)),
+                |ui| {
+                    ui.set_clip_rect(ui.clip_rect().intersect(controls_rect));
                     ui.add_space(36.0);
                     if ui.button("Transition").clicked() {
                         self.app.backend.trigger_transition();
                     }
-                    ui.add_space(12.0);
                     let mut tbar = self.app.backend.tbar_position();
                     if ui
                         .add(
@@ -1038,23 +1064,8 @@ impl<'a> ObsTabViewer<'a> {
                         self.app.backend.set_tbar_position(tbar);
                     }
                     ui.small("T-Bar");
-                });
-
-                ui.vertical(|ui| {
-                    ui.set_width(panel_w);
-                    ui.centered_and_justified(|ui| {
-                        ui.colored_label(Color32::from_rgb(240, 75, 75), "PROGRAM");
-                    });
-                    if let Some(prog_id) = self.app.prog_tex_id {
-                        self.draw_interactive_canvas(
-                            ui,
-                            prog_id,
-                            Vec2::new(panel_w, panel_h),
-                            false,
-                        );
-                    }
-                });
-            });
+                },
+            );
         } else if let Some(prog_id) = self.app.prog_tex_id {
             self.draw_interactive_canvas(ui, prog_id, avail, true);
         } else {
@@ -1120,6 +1131,35 @@ impl<'a> ObsTabViewer<'a> {
         );
         if (resp.clicked() || resp.drag_started()) && self.app.remove_target.is_none() {
             resp.request_focus();
+        }
+        resp.context_menu(|ui| {
+            let has_selection = !self.app.selected_items.is_empty();
+            ui.add_enabled_ui(has_selection, |ui| {
+                ui.menu_button("Transform", |ui| {
+                    if ui.button("Fit to Screen     Ctrl+F").clicked() {
+                        self.app.transform_selected(TransformOp::Fit);
+                        ui.close_menu();
+                    }
+                    if ui.button("Center to Screen     Ctrl+D").clicked() {
+                        self.app.transform_selected(TransformOp::Center);
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+        if resp.has_focus() {
+            let transform = ui.input_mut(|input| {
+                if input.consume_key(egui::Modifiers::CTRL, egui::Key::F) {
+                    Some(TransformOp::Fit)
+                } else if input.consume_key(egui::Modifiers::CTRL, egui::Key::D) {
+                    Some(TransformOp::Center)
+                } else {
+                    None
+                }
+            });
+            if let Some(op) = transform {
+                self.app.transform_selected(op);
+            }
         }
         if resp.has_focus()
             && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
@@ -1935,13 +1975,12 @@ impl<'a> ObsTabViewer<'a> {
         } else {
             "Start Streaming"
         })
-        .min_size(Vec2::new(btn_w, 28.0))
         .fill(if streaming {
             Color32::from_rgb(38, 125, 220)
         } else {
             Color32::from_rgb(48, 53, 66)
         });
-        if ui.add(stream_btn).clicked() {
+        if ui.add_sized([btn_w, 34.0], stream_btn).clicked() {
             let res = if streaming {
                 self.app.backend.stop_streaming()
             } else {
@@ -1963,13 +2002,12 @@ impl<'a> ObsTabViewer<'a> {
             } else {
                 "Start Recording"
             })
-            .min_size(Vec2::new(rec_w, 28.0))
             .fill(if recording {
                 Color32::from_rgb(190, 48, 48)
             } else {
                 Color32::from_rgb(48, 53, 66)
             });
-            if ui.add(rec_btn).clicked() {
+            if ui.add_sized([rec_w, 34.0], rec_btn).clicked() {
                 if recording {
                     match self.app.backend.stop_recording() {
                         Ok(p) => {
@@ -1986,7 +2024,7 @@ impl<'a> ObsTabViewer<'a> {
             if recording {
                 let p_lbl = if paused { "Go" } else { "||" };
                 if ui
-                    .add_sized([42.0, 28.0], egui::Button::new(p_lbl))
+                    .add_sized([42.0, 34.0], egui::Button::new(p_lbl))
                     .on_hover_text(if paused {
                         "Resume Recording"
                     } else {
@@ -2012,13 +2050,12 @@ impl<'a> ObsTabViewer<'a> {
             } else {
                 "Start Replay Buffer"
             })
-            .min_size(Vec2::new(rw, 26.0))
             .fill(if replay_active {
                 Color32::from_rgb(40, 130, 175)
             } else {
                 Color32::from_rgb(48, 53, 66)
             });
-            if ui.add(rb_btn).clicked() {
+            if ui.add_sized([rw, 32.0], rb_btn).clicked() {
                 let res = if replay_active {
                     self.app.backend.stop_replay_buffer()
                 } else {
@@ -2030,7 +2067,7 @@ impl<'a> ObsTabViewer<'a> {
             }
             if replay_active
                 && ui
-                    .add_sized([36.0, 26.0], egui::Button::new("Save"))
+                    .add_sized([36.0, 32.0], egui::Button::new("Save"))
                     .on_hover_text("Save Replay")
                     .clicked()
             {
@@ -2045,19 +2082,17 @@ impl<'a> ObsTabViewer<'a> {
         });
 
         let studio = self.app.backend.studio_mode();
-        let st_btn = egui::Button::new("Studio Mode")
-            .min_size(Vec2::new(btn_w, 26.0))
-            .fill(if studio {
-                Color32::from_rgb(46, 107, 230)
-            } else {
-                Color32::from_rgb(48, 53, 66)
-            });
-        if ui.add(st_btn).clicked() {
+        let st_btn = egui::Button::new("Studio Mode").fill(if studio {
+            Color32::from_rgb(46, 107, 230)
+        } else {
+            Color32::from_rgb(48, 53, 66)
+        });
+        if ui.add_sized([btn_w, 32.0], st_btn).clicked() {
             self.app.backend.set_studio_mode(!studio);
         }
 
         if ui
-            .add_sized([btn_w, 26.0], egui::Button::new("Settings"))
+            .add_sized([btn_w, 32.0], egui::Button::new("Settings"))
             .clicked()
         {
             self.app.settings_modal.draft = self.app.backend.settings();

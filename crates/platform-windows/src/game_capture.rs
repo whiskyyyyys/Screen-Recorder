@@ -20,6 +20,7 @@ pub struct GameCapturer {
     window_capturer: WindowCapturer,
     dxgi: Option<(usize, DisplayCapturer)>,
     last_valid_frame: Option<VideoFrame>,
+    last_window_frame_seq: Option<u64>,
     seq: u64,
 }
 
@@ -67,6 +68,7 @@ impl GameCapturer {
             window_capturer,
             dxgi: None,
             last_valid_frame: None,
+            last_window_frame_seq: None,
             seq: 0,
         }
     }
@@ -97,18 +99,18 @@ impl GameCapturer {
         let mon_top = dxgi.monitor().top;
         let mon_frame = match dxgi.capture_frame(8, pts_us) {
             Ok(Some(frame)) => frame,
-            Ok(None) => dxgi.last_frame()?,
-            Err(_) => return dxgi.last_frame(),
+            Ok(None) => return self.last_valid_frame.clone(),
+            Err(_) => return None,
         };
-        let cropped = crop_frame_to_rect(&mon_frame, mon_left, mon_top, rect, &mut self.seq);
+        let cropped = crop_frame_to_rect(&mon_frame, mon_left, mon_top, rect)?;
         if is_frame_all_black(&cropped.data) {
             None
         } else {
-            Some(cropped)
+            Some(self.remember_frame(cropped))
         }
     }
 
-    fn maybe_scale(&mut self, frame: VideoFrame) -> VideoFrame {
+    fn maybe_scale(&self, frame: VideoFrame) -> VideoFrame {
         if !self.force_scaling
             || (frame.width == self.scale_width && frame.height == self.scale_height)
             || frame.width == 0
@@ -116,7 +118,7 @@ impl GameCapturer {
         {
             return frame;
         }
-        scale_rgba_bilinear(&frame, self.scale_width, self.scale_height, &mut self.seq)
+        scale_rgba_bilinear(&frame, self.scale_width, self.scale_height)
     }
 
     pub fn capture_frame(&mut self, pts_us: u64) -> Result<Option<VideoFrame>> {
@@ -125,12 +127,11 @@ impl GameCapturer {
         if self.mode == "AnyFullscreen" {
             if let Some((full_rect, mon_idx)) = detect_fullscreen_foreground(self_pid) {
                 if let Some(frame) = self.capture_dxgi_rect(mon_idx, full_rect, pts_us) {
-                    self.last_valid_frame = Some(frame.clone());
-                    return Ok(Some(self.maybe_scale(frame)));
+                    return Ok(Some(frame));
                 }
             }
             // Do not capture OxideStudio itself when user alt-tabs back to OBS; retain last valid game frame
-            return Ok(self.last_valid_frame.clone().map(|f| self.maybe_scale(f)));
+            return Ok(self.last_valid_frame.clone());
         }
 
         // SpecificWindow mode: use monitor-matched DXGI when target is foreground (or forced DXGI),
@@ -144,21 +145,28 @@ impl GameCapturer {
                     let mon_idx =
                         monitor_index_for_rect(rect.left, rect.top, rect.right, rect.bottom);
                     if let Some(frame) = self.capture_dxgi_rect(mon_idx, rect, pts_us) {
-                        self.last_valid_frame = Some(frame.clone());
-                        return Ok(Some(self.maybe_scale(frame)));
+                        return Ok(Some(frame));
                     }
                 }
             }
         }
 
         if let Some(frame) = self.window_capturer.capture_frame(pts_us)? {
-            if !is_frame_all_black(&frame.data) || self.last_valid_frame.is_none() {
-                self.last_valid_frame = Some(frame.clone());
-                return Ok(Some(self.maybe_scale(frame)));
+            let is_new = self.last_window_frame_seq.replace(frame.seq) != Some(frame.seq);
+            if is_new && (!is_frame_all_black(&frame.data) || self.last_valid_frame.is_none()) {
+                return Ok(Some(self.remember_frame(frame)));
             }
         }
 
-        Ok(self.last_valid_frame.clone().map(|f| self.maybe_scale(f)))
+        Ok(self.last_valid_frame.clone())
+    }
+
+    fn remember_frame(&mut self, frame: VideoFrame) -> VideoFrame {
+        let mut frame = self.maybe_scale(frame);
+        self.seq = self.seq.wrapping_add(1);
+        frame.seq = self.seq;
+        self.last_valid_frame = Some(frame.clone());
+        frame
     }
 }
 
@@ -193,15 +201,23 @@ fn crop_frame_to_rect(
     mon_left: i32,
     mon_top: i32,
     rect: RECT,
-    seq: &mut u64,
-) -> VideoFrame {
-    let rx = (rect.left - mon_left).clamp(0, src.width.saturating_sub(1) as i32) as u32;
-    let ry = (rect.top - mon_top).clamp(0, src.height.saturating_sub(1) as i32) as u32;
-    let rw = ((rect.right - rect.left).max(1) as u32).min(src.width.saturating_sub(rx).max(1));
-    let rh = ((rect.bottom - rect.top).max(1) as u32).min(src.height.saturating_sub(ry).max(1));
+) -> Option<VideoFrame> {
+    let rx = (rect.left - mon_left).max(0);
+    let ry = (rect.top - mon_top).max(0);
+    let right = (rect.right - mon_left).min(src.width as i32);
+    let bottom = (rect.bottom - mon_top).min(src.height as i32);
+    if right <= rx || bottom <= ry {
+        return None;
+    }
+    let (rx, ry, rw, rh) = (
+        rx as u32,
+        ry as u32,
+        (right - rx) as u32,
+        (bottom - ry) as u32,
+    );
 
     if rx == 0 && ry == 0 && rw == src.width && rh == src.height {
-        return src.clone();
+        return Some(src.clone());
     }
 
     let mut out = vec![0u8; (rw as usize) * (rh as usize) * 4];
@@ -211,11 +227,10 @@ fn crop_frame_to_rect(
         let row_bytes = (rw as usize) * 4;
         out[dst_off..dst_off + row_bytes].copy_from_slice(&src.data[src_off..src_off + row_bytes]);
     }
-    *seq += 1;
-    VideoFrame::new_rgba(rw, rh, out, src.pts_us, *seq)
+    Some(VideoFrame::new_rgba(rw, rh, out, src.pts_us, src.seq))
 }
 
-fn scale_rgba_bilinear(src: &VideoFrame, dst_w: u32, dst_h: u32, seq: &mut u64) -> VideoFrame {
+fn scale_rgba_bilinear(src: &VideoFrame, dst_w: u32, dst_h: u32) -> VideoFrame {
     let sw = src.width.max(1) as usize;
     let sh = src.height.max(1) as usize;
     let dw = dst_w.max(2) as usize;
@@ -250,6 +265,5 @@ fn scale_rgba_bilinear(src: &VideoFrame, dst_w: u32, dst_h: u32, seq: &mut u64) 
         }
     }
 
-    *seq += 1;
-    VideoFrame::new_rgba(dst_w, dst_h, out, src.pts_us, *seq)
+    VideoFrame::new_rgba(dst_w, dst_h, out, src.pts_us, src.seq)
 }
