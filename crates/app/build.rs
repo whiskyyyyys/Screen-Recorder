@@ -12,33 +12,38 @@ fn main() {
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let rc_path = out_dir.join("app_icon.rc");
-    let res_obj = out_dir.join("app_icon_res.o");
+    let res_obj = out_dir.join("app_icon_res.obj");
     let abs_ico = fs::canonicalize(ico_path).unwrap_or_else(|_| ico_path.to_path_buf());
-    let rc_ico = abs_ico.to_string_lossy().replace('\\', "/");
+    let rc_ico = abs_ico
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/");
     let _ = fs::write(&rc_path, format!("1 ICON \"{rc_ico}\"\n"));
 
-    // Use native windres if installed in PATH (e.g. GitHub Actions / MSYS2),
-    // otherwise emit a pure-Rust x64 COFF .rsrc object so the Windows EXE icon always embeds cleanly!
-    if let Ok(status) = Command::new("windres")
-        .args([
-            rc_path.to_str().unwrap(),
-            "-O",
-            "coff",
-            "-o",
-            res_obj.to_str().unwrap(),
-        ])
-        .status()
-    {
-        if status.success() && res_obj.exists() {
-            println!("cargo:rustc-link-arg={}", res_obj.display());
-            return;
+    // Use native windres on GNU toolchains if installed in PATH,
+    // otherwise emit a pure-Rust x64 COFF .rsrc object so the Windows EXE icon always embeds cleanly on MSVC too!
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
+        if let Ok(status) = Command::new("windres")
+            .args([
+                rc_path.to_str().unwrap(),
+                "-O",
+                "coff",
+                "-o",
+                res_obj.to_str().unwrap(),
+            ])
+            .status()
+        {
+            if status.success() && res_obj.exists() {
+                println!("cargo:rustc-link-arg-bin=obs-rust={}", res_obj.display());
+                return;
+            }
         }
     }
 
     if let Ok(ico_bytes) = fs::read(ico_path) {
         if let Some(coff) = build_icon_coff_x64(&ico_bytes) {
             if fs::write(&res_obj, coff).is_ok() {
-                println!("cargo:rustc-link-arg={}", res_obj.display());
+                println!("cargo:rustc-link-arg-bin=obs-rust={}", res_obj.display());
             }
         }
     }

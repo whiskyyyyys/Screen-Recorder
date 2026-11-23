@@ -6,6 +6,10 @@ on:
     tags: [ 'v*' ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,12 +53,15 @@ jobs:
         run: cargo test --workspace -- --test-threads=1
 
       - name: Run headless end-to-end self-test
-        run: .\target\release\obs-rust.exe --self-test
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\target\release\obs-rust.exe" -ArgumentList "--self-test" -NoNewWindow -Wait -PassThru
+          exit $p.ExitCode
 
       - name: Package Portable ZIP and Windows Setup Installer
         shell: pwsh
         run: |
-          .\packaging\windows\package.ps1 -SkipBuild
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\packaging\windows\package.ps1 -SkipBuild
           Get-FileHash dist\OBS-Rust-Portable-x64.zip, dist\OBS-Rust-Setup-x64.exe -Algorithm SHA256 | Format-Table -AutoSize
           (Get-FileHash dist\OBS-Rust-Portable-x64.zip -Algorithm SHA256).Hash + "  OBS-Rust-Portable-x64.zip" | Out-File dist\SHA256SUMS.txt -Encoding ascii
           (Get-FileHash dist\OBS-Rust-Setup-x64.exe -Algorithm SHA256).Hash + "  OBS-Rust-Setup-x64.exe" | Out-File dist\SHA256SUMS.txt -Append -Encoding ascii

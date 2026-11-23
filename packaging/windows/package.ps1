@@ -1,4 +1,4 @@
-﻿param(
+param(
     [switch]$SkipBuild = $false
 )
 
@@ -76,7 +76,7 @@ if ($Iscc) {
     Write-Host "Compiling Windows Installer via $Iscc..."
     & $Iscc (Join-Path $PSScriptRoot "installer.iss")
 } else {
-    Write-Warning "ISCC.exe (Inno Setup 6) not found — skipped Setup EXE build."
+    Write-Warning "ISCC.exe (Inno Setup 6) not found - skipped Setup EXE build."
 }
 
 Get-ChildItem $DistDir -File | Select-Object Name, Length | Format-Table -AutoSize

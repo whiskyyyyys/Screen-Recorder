@@ -186,6 +186,13 @@ impl GpuCompositor {
             compatible_surface: None,
             force_fallback_adapter: false,
         }))
+        .or_else(|| {
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::LowPower,
+                compatible_surface: None,
+                force_fallback_adapter: true,
+            }))
+        })
         .ok_or_else(|| ObsError::Renderer("No compatible wgpu adapter found".to_string()))?;
 
         let info = adapter.get_info();

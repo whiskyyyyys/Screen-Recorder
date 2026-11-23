@@ -2,7 +2,7 @@
 #define AppName "OxideStudio (OBS-Rust)"
 #define AppVersion "0.1.0"
 #define AppPublisher "OxideStudio Contributors"
-#define AppURL "https://github.com/whiskyyyyys/obs-rust"
+#define AppURL "https://github.com/whiskyyyyys/Screen-Recorder"
 #define AppExeName "obs-rust.exe"
 
 [Setup]
