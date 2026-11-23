@@ -414,7 +414,7 @@ impl ObsEngine {
         })
         .map_err(|e| format!("Self-test start recording failed: {e}"))?;
 
-        let silent_track = vec![0.0f32; 960 * 2];
+        let silent_track = vec![0.0f32; 1600 * 2];
         let tracks = [
             silent_track.clone(),
             silent_track.clone(),
@@ -435,7 +435,7 @@ impl ObsEngine {
                 }
             }
             rec.push_audio_tracks(&tracks);
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(33));
         }
         let saved = rec
             .stop()

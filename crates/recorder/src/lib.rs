@@ -63,7 +63,10 @@ pub fn expand_recording_filename(dir: &str, pattern: &str, format: RecordingForm
     for (obs_tok, chrono_tok) in replacements {
         name = name.replace(obs_tok, chrono_tok);
     }
-    let formatted = now.format(&name).to_string();
+    let mut formatted = String::new();
+    if std::fmt::write(&mut formatted, format_args!("{}", now.format(&name))).is_err() {
+        formatted.clear();
+    }
     let safe_name = if formatted.trim().is_empty() {
         now.format("%Y-%m-%d %H-%M-%S").to_string()
     } else {
@@ -92,6 +95,13 @@ pub struct RecordingSession {
 
 impl RecordingSession {
     pub fn start(config: RecordingConfig) -> Result<Self> {
+        validate_recording_format(config.format, config.audio_track_mask)?;
+        if config.output_path.exists() {
+            return Err(ObsError::Recorder(format!(
+                "Recording already exists: {}. Choose a different filename.",
+                config.output_path.display()
+            )));
+        }
         let ffmpeg = locate_ffmpeg()?;
         if let Some(parent) = config.output_path.parent() {
             fs::create_dir_all(parent)?;
@@ -119,7 +129,7 @@ impl RecordingSession {
         #[cfg(windows)]
         cmd.creation_flags(CREATE_NO_WINDOW);
         cmd.args([
-            "-y",
+            "-n",
             "-hide_banner",
             "-loglevel",
             "error",
@@ -404,10 +414,38 @@ impl RecordingSession {
     }
 }
 
+fn validate_recording_format(format: RecordingFormat, mask: u8) -> Result<()> {
+    if format == RecordingFormat::Flv && (mask & 0x3f).count_ones() > 1 {
+        return Err(ObsError::InvalidArgument(
+            "FLV supports only one audio track. Select one track or use MKV/MP4.".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Drop for RecordingSession {
     fn drop(&mut self) {
         if self.running.load(Ordering::Relaxed) {
             let _ = self.stop_inner();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flv_rejects_multiple_audio_tracks() {
+        assert!(validate_recording_format(RecordingFormat::Flv, 3).is_err());
+        assert!(validate_recording_format(RecordingFormat::Flv, 2).is_ok());
+        assert!(validate_recording_format(RecordingFormat::Mkv, 3).is_ok());
+    }
+
+    #[test]
+    fn invalid_filename_pattern_does_not_panic() {
+        let path = expand_recording_filename(".", "%Q", RecordingFormat::Mkv);
+        assert_eq!(path.extension().and_then(|s| s.to_str()), Some("mkv"));
+        assert!(!path.file_stem().unwrap().is_empty());
     }
 }
