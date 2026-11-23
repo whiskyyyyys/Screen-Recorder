@@ -62,7 +62,10 @@ fn ffprobe_video_codec(path: &std::path::Path) -> String {
 }
 
 fn main() {
-    println!("=== OxideStudio (OBS-Rust) v0.1.0 Benchmark Suite ===");
+    println!(
+        "=== OxideStudio (OBS-Rust) v{} Benchmark Suite ===",
+        env!("CARGO_PKG_VERSION")
+    );
 
     // 1. GPU Compositor 1080p Benchmark
     let cfg = VideoConfig {

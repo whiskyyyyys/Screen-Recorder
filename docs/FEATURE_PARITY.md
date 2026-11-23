@@ -1,13 +1,13 @@
 # OxideStudio (OBS-Rust) — Feature Parity Matrix
 
-> **Honesty Policy**: Features are marked **Verified** only when backed by real implementation AND passing automated/live verification on Windows x64. Features with narrower scope than upstream C++ OBS Studio are marked **Partial**, and unimplemented features remain **Planned** (not claimed in v0.1.0).
+> **Honesty Policy**: Features are marked **Verified** only when backed by real implementation AND passing automated/live verification on Windows x64. Features with narrower scope than upstream C++ OBS Studio are marked **Partial**, and unimplemented features remain **Planned** (not claimed in v0.1.1).
 
 ## Summary Legend
 - **Verified**: Real implementation tested end-to-end (unit/integration tests, `--self-test`, live GUI run, and/or driver probe).
 - **Partial**: Functional implementation with explicit scope boundaries documented in Notes.
-- **Planned**: Not implemented in `v0.1.0`.
+- **Planned**: Not implemented in `v0.1.1`.
 
-## Subsystem Parity Status (`v0.1.0`)
+## Subsystem Parity Status (`v0.1.1`)
 
 | Category | Feature | Status | Notes & Evidence |
 |---|---|---|---|
@@ -35,10 +35,10 @@
 | Streaming | RTMP / RTMPS (pure Rust) + SRT + Services + Multi-Output | Verified | `rml_rtmp` + Schannel TLS; live loopback RTMP publish test passed (`streaming_and_websocket_tests`) |
 | Audio Mixer | 6-Track Routing, VU Peak/RMS Meters, Sync Offset, Monitor | Verified | Cubic fader, delay ring buffer, track routing & meters (`scene_and_audio_tests`) |
 | Audio Filters | Gain, Gate, Compressor, Limiter, Expander, Noise Supp, EQ, Polarity | Verified | Stateful pure-Rust DSP; verified ceiling, gate & sync delay (`scene_and_audio_tests`) |
-| Audio Plugins | Native VST2/VST3 Plugin Hosting | **Planned** | Not implemented in `v0.1.0` |
+| Audio Plugins | Native VST2/VST3 Plugin Hosting | **Planned** | Not implemented in `v0.1.1` |
 | Video Filters | Chroma/Color/Luma Key, Color Corr, Crop, Scale, Scroll, Sharpen, Mask, Delay, Custom WGSL | Verified | Multi-pass ping-pong filter chain + Chroma Key verified (`gpu_renderer_tests`) |
 | Transitions | Cut, Fade, Swipe, Slide, FadeToColor, LumaWipe, Stinger | Verified | 35 luma wipe assets bundled; Fade/Swipe/LumaWipe verified in `gpu_renderer_tests` |
 | UI & Settings | Dockable OBS Layout, Dark/Light/A11y Themes, 9-Tab Settings, Profiles | Verified | `eframe`/`egui`/`egui_dock`; settings & profile persistence verified (`scene_and_audio_tests`); live GUI verified |
 | Plugins | OxideStudio Rust C-ABI v1 Dynamic Plugins | Verified | `sample_vignette_plugin.dll` loaded, ABI-checked & processed RGBA (`windows_capture_and_plugins_tests`) |
-| Plugins | Upstream C/C++ OBS `.dll` Binary Compatibility Shim | **Planned** | Not implemented or claimed in `v0.1.0` |
+| Plugins | Upstream C/C++ OBS `.dll` Binary Compatibility Shim | **Planned** | Not implemented or claimed in `v0.1.1` |
 | WebSocket | OBS WebSocket 5.x (OpCodes 0–9, SHA-256 auth, 40+ RPCs, Events) | Verified | Live WebSocket SHA-256 handshake & scene/record/audio RPCs tested (`streaming_and_websocket_tests`) |

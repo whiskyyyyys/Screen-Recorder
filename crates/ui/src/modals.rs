@@ -2336,7 +2336,7 @@ pub fn render_about_modal(ctx: &egui::Context, open: &mut bool, backend: &dyn St
         .open(&mut win_open)
         .default_width(540.0)
         .show(ctx, |ui| {
-            ui.heading("OxideStudio v0.1.0");
+            ui.heading(format!("OxideStudio v{}", env!("CARGO_PKG_VERSION")));
             ui.label("Independent Rust rebuild of OBS Studio architecture — GPL-2.0 License.");
             ui.small("Not affiliated with or endorsed by the OBS Project.");
             ui.separator();
