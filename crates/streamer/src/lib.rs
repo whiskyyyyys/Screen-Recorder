@@ -11,6 +11,9 @@ use crossbeam_channel::{bounded, Sender};
 use obs_core::{ObsError, Result, StreamState, StreamingStats};
 use obs_encoder::{build_video_encoder_args, locate_ffmpeg, VideoEncodeParams};
 use obs_recorder::named_pipe::{PipeCancelToken, WindowsNamedPipe};
+use obs_recorder::{
+    new_shared_video_slot, publish_shared_video_frame, run_cfr_video_pipe_loop, SharedVideoSlot,
+};
 use obs_settings::{ExtraOutputConfig, StreamProtocol};
 use obs_video::{ColorRange, ColorSpace};
 use parking_lot::Mutex;
@@ -122,12 +125,12 @@ struct FlvPacket {
 
 struct SpawnedEncoder {
     proc: EncoderProcess,
-    video_tx: Sender<Vec<u8>>,
     audio_tx: Sender<Vec<u8>>,
 }
 
 struct EncoderProcess {
     running: Arc<AtomicBool>,
+    video_slot: SharedVideoSlot,
     pipe_cancel: Arc<PipeCancelToken>,
     child: Option<Child>,
     threads: Vec<JoinHandle<()>>,
@@ -136,6 +139,7 @@ struct EncoderProcess {
 impl EncoderProcess {
     fn stop_clean(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        self.video_slot.1.notify_all();
         self.pipe_cancel.cancel();
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
@@ -149,7 +153,7 @@ impl EncoderProcess {
 
 pub struct StreamSession {
     config: StreamSessionConfig,
-    video_tx: Arc<Mutex<Option<Sender<Vec<u8>>>>>,
+    video_slot: SharedVideoSlot,
     audio_tx: Arc<Mutex<Option<Sender<Vec<u8>>>>>,
     running: Arc<AtomicBool>,
     state: Arc<Mutex<StreamState>>,
@@ -364,11 +368,13 @@ impl StreamSession {
             }
         }
 
+        let video_slot = new_shared_video_slot();
         let spawned = spawn_stream_encoder(
             &ffmpeg,
             &config,
             config.bitrate_kbps,
             use_srt_direct,
+            Arc::clone(&video_slot),
             &out_senders,
             &total_frames,
             &dropped_frames,
@@ -376,14 +382,13 @@ impl StreamSession {
             &last_flv_ts_ms,
         )?;
 
-        let video_tx = Arc::new(Mutex::new(Some(spawned.video_tx)));
         let audio_tx = Arc::new(Mutex::new(Some(spawned.audio_tx)));
         let encoder_proc = Arc::new(Mutex::new(Some(spawned.proc)));
 
         let supervisor_thread = if config.dynamic_bitrate && !use_srt_direct {
             let sup_run = Arc::clone(&running);
             let sup_proc = Arc::clone(&encoder_proc);
-            let sup_vtx = Arc::clone(&video_tx);
+            let sup_slot = Arc::clone(&video_slot);
             let sup_atx = Arc::clone(&audio_tx);
             let sup_drop = Arc::clone(&dropped_frames);
             let sup_rtt = Arc::clone(&rtt_ms_bits);
@@ -417,7 +422,6 @@ impl StreamSession {
                             let send_ms = f64::from_bits(sup_rtt.load(Ordering::Relaxed));
 
                             if let Some(new_kbps) = ctrl.evaluate(dropped_delta, send_ms) {
-                                *sup_vtx.lock() = None;
                                 *sup_atx.lock() = None;
                                 if let Some(mut old) = sup_proc.lock().take() {
                                     old.stop_clean();
@@ -433,6 +437,7 @@ impl StreamSession {
                                     &sup_cfg,
                                     new_kbps,
                                     false,
+                                    Arc::clone(&sup_slot),
                                     &sup_senders,
                                     &sup_tot,
                                     &sup_drop,
@@ -441,7 +446,6 @@ impl StreamSession {
                                 ) {
                                     sup_dyn_br.store(new_kbps, Ordering::Relaxed);
                                     *sup_proc.lock() = Some(next_enc.proc);
-                                    *sup_vtx.lock() = Some(next_enc.video_tx);
                                     *sup_atx.lock() = Some(next_enc.audio_tx);
                                 }
                             }
@@ -455,7 +459,7 @@ impl StreamSession {
 
         Ok(Self {
             config,
-            video_tx,
+            video_slot,
             audio_tx,
             running,
             state,
@@ -475,14 +479,12 @@ impl StreamSession {
     }
 
     pub fn push_video_nv12(&self, nv12: &[u8]) {
-        if !self.running.load(Ordering::Relaxed) {
-            return;
-        }
-        let tx_opt = self.video_tx.lock().clone();
-        if let Some(tx) = tx_opt {
-            if tx.try_send(nv12.to_vec()).is_err() {
-                self.dropped_frames.fetch_add(1, Ordering::Relaxed);
-            }
+        self.push_video_nv12_shared(Arc::new(nv12.to_vec()));
+    }
+
+    pub fn push_video_nv12_shared(&self, nv12: Arc<Vec<u8>>) {
+        if self.running.load(Ordering::Relaxed) {
+            publish_shared_video_frame(&self.video_slot, nv12);
         }
     }
 
@@ -531,7 +533,7 @@ impl StreamSession {
     pub fn stop(&mut self) {
         *self.state.lock() = StreamState::Stopping;
         self.running.store(false, Ordering::SeqCst);
-        *self.video_tx.lock() = None;
+        self.video_slot.1.notify_all();
         *self.audio_tx.lock() = None;
         if let Some(sup) = self.supervisor_thread.take() {
             let _ = sup.join();
@@ -558,6 +560,7 @@ fn spawn_stream_encoder(
     config: &StreamSessionConfig,
     bitrate_kbps: u32,
     use_srt_direct: bool,
+    video_slot: SharedVideoSlot,
     out_senders: &[tokio::sync::mpsc::Sender<FlvPacket>],
     total_frames: &Arc<AtomicU64>,
     dropped_frames: &Arc<AtomicU64>,
@@ -569,7 +572,6 @@ fn spawn_stream_encoder(
     let pipe_cancel = audio_pipe.cancel_token();
     let pipe_path = audio_pipe.path.clone();
 
-    let (video_tx, video_rx) = bounded::<Vec<u8>>(16);
     let (audio_tx, audio_rx) = bounded::<Vec<u8>>(128);
 
     let mut cmd = Command::new(ffmpeg);
@@ -650,7 +652,7 @@ fn spawn_stream_encoder(
         .spawn()
         .map_err(|e| ObsError::Stream(format!("Failed spawning stream encoder: {e}")))?;
 
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| ObsError::Stream("Missing stream encoder stdin".into()))?;
@@ -659,26 +661,17 @@ fn spawn_stream_encoder(
     let proc_running = Arc::new(AtomicBool::new(true));
     let mut threads = Vec::new();
 
-    // Video encoder feeder
+    // Video encoder feeder (monotonic CFR pacing)
     let r_v = Arc::clone(&proc_running);
+    let slot_v = Arc::clone(&video_slot);
     let tf_v = Arc::clone(total_frames);
     let df_v = Arc::clone(dropped_frames);
+    let fps = config.fps.max(1);
     threads.push(
         thread::Builder::new()
             .name("obs-stream-vid".into())
             .spawn(move || {
-                use std::io::Write;
-                while let Ok(frame) = video_rx.recv() {
-                    if stdin.write_all(&frame).is_err() {
-                        df_v.fetch_add(1, Ordering::Relaxed);
-                        break;
-                    }
-                    tf_v.fetch_add(1, Ordering::Relaxed);
-                    if !r_v.load(Ordering::Relaxed) && video_rx.is_empty() {
-                        break;
-                    }
-                }
-                let _ = stdin.flush();
+                run_cfr_video_pipe_loop(stdin, slot_v, r_v, None, fps, tf_v, df_v);
             })
             .map_err(ObsError::Io)?,
     );
@@ -723,15 +716,12 @@ fn spawn_stream_encoder(
 
     let proc = EncoderProcess {
         running: proc_running,
+        video_slot,
         pipe_cancel,
         child: Some(child),
         threads,
     };
-    Ok(SpawnedEncoder {
-        proc,
-        video_tx,
-        audio_tx,
-    })
+    Ok(SpawnedEncoder { proc, audio_tx })
 }
 
 fn pump_flv_tags(

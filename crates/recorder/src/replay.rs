@@ -1,4 +1,7 @@
 use crate::named_pipe::{PipeCancelToken, WindowsNamedPipe};
+use crate::{
+    new_shared_video_slot, publish_shared_video_frame, run_cfr_video_pipe_loop, SharedVideoSlot,
+};
 use crossbeam_channel::{bounded, Sender};
 use obs_core::{ObsError, ReplayBufferState, ReplayStats, Result};
 use obs_encoder::{build_video_encoder_args, locate_ffmpeg, VideoEncodeParams};
@@ -9,7 +12,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -50,7 +53,7 @@ pub struct ReplayBufferConfig {
 }
 
 pub struct ReplayBufferSession {
-    video_tx: Sender<Vec<u8>>,
+    video_slot: SharedVideoSlot,
     audio_tx: Sender<Vec<u8>>,
     running: Arc<AtomicBool>,
     ring: Arc<Mutex<RingStore>>,
@@ -71,7 +74,7 @@ impl ReplayBufferSession {
         let pipe_path = pipe.path.clone();
 
         let (audio_tx, audio_rx) = bounded::<Vec<u8>>(128);
-        let (video_tx, video_rx) = bounded::<Vec<u8>>(8);
+        let video_slot = new_shared_video_slot();
         let running = Arc::new(AtomicBool::new(true));
 
         let mut cmd = Command::new(&ffmpeg);
@@ -140,7 +143,7 @@ impl ReplayBufferSession {
             .spawn()
             .map_err(|e| ObsError::Recorder(format!("Failed spawning Replay FFmpeg: {e}")))?;
 
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .ok_or_else(|| ObsError::Recorder("Missing replay stdin".into()))?;
@@ -151,24 +154,17 @@ impl ReplayBufferSession {
 
         let mut threads = Vec::new();
 
-        // Video writer thread
+        // Video writer thread (strict monotonic CFR pacing)
         let r_vid = Arc::clone(&running);
+        let slot_vid = Arc::clone(&video_slot);
+        let fps = cfg.fps.max(1);
         threads.push(
             thread::Builder::new()
                 .name("obs-replay-vid".into())
                 .spawn(move || {
-                    while r_vid.load(Ordering::Relaxed) {
-                        match video_rx.recv_timeout(Duration::from_millis(50)) {
-                            Ok(frame) => {
-                                if stdin.write_all(&frame).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                        }
-                    }
-                    let _ = stdin.flush();
+                    let written = Arc::new(AtomicU64::new(0));
+                    let dropped = Arc::new(AtomicU64::new(0));
+                    run_cfr_video_pipe_loop(stdin, slot_vid, r_vid, None, fps, written, dropped);
                 })
                 .map_err(ObsError::Io)?,
         );
@@ -219,7 +215,7 @@ impl ReplayBufferSession {
         );
 
         Ok(Self {
-            video_tx,
+            video_slot,
             audio_tx,
             running,
             ring,
@@ -233,7 +229,13 @@ impl ReplayBufferSession {
     }
 
     pub fn push_video_nv12(&self, nv12: &[u8]) {
-        let _ = self.video_tx.try_send(nv12.to_vec());
+        self.push_video_nv12_shared(Arc::new(nv12.to_vec()));
+    }
+
+    pub fn push_video_nv12_shared(&self, nv12: Arc<Vec<u8>>) {
+        if self.running.load(Ordering::Relaxed) {
+            publish_shared_video_frame(&self.video_slot, nv12);
+        }
     }
 
     pub fn push_audio_f32(&self, stereo_f32: &[f32]) {
@@ -341,6 +343,7 @@ impl ReplayBufferSession {
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        self.video_slot.1.notify_all();
         self.pipe_cancel.cancel();
         *self.state.lock() = ReplayBufferState::Stopped;
         if let Some(mut c) = self.child.lock().take() {

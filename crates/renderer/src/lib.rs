@@ -86,6 +86,7 @@ struct CachedSourceTex {
 struct RenderTarget {
     tex: wgpu::Texture,
     view: wgpu::TextureView,
+    srgb_view: wgpu::TextureView,
     width: u32,
     height: u32,
 }
@@ -109,12 +110,18 @@ impl RenderTarget {
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC
                 | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
+            view_formats: &[wgpu::TextureFormat::Rgba8UnormSrgb],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let srgb_view = tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("sRGB Display View"),
+            format: Some(wgpu::TextureFormat::Rgba8UnormSrgb),
+            ..Default::default()
+        });
         Self {
             tex,
             view,
+            srgb_view,
             width: w,
             height: h,
         }
@@ -519,6 +526,22 @@ impl GpuCompositor {
 
     pub fn multiview_view(&self) -> &wgpu::TextureView {
         &self.multiview_rt.view
+    }
+
+    /// sRGB view required by `egui_wgpu`'s shader so it linearizes pixels once on sample
+    /// instead of applying double-gamma washout to sRGB-encoded canvas contents.
+    pub fn program_egui_view(&self) -> &wgpu::TextureView {
+        &self.program_rt.srgb_view
+    }
+
+    /// sRGB view for Studio Mode Preview in `egui_wgpu`.
+    pub fn preview_egui_view(&self) -> &wgpu::TextureView {
+        &self.preview_rt.srgb_view
+    }
+
+    /// sRGB view for Multiview in `egui_wgpu`.
+    pub fn multiview_egui_view(&self) -> &wgpu::TextureView {
+        &self.multiview_rt.srgb_view
     }
 
     pub fn canvas_size(&self) -> (u32, u32) {
@@ -1925,23 +1948,10 @@ impl GpuCompositor {
         }
         let img = image::open(Path::new(path)).ok()?.to_rgba8();
         let (w, h) = img.dimensions();
-        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Cached Aux Image"),
-            size: wgpu::Extent3d {
-                width: w.max(1),
-                height: h.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let rt = RenderTarget::new(&self.device, w, h, "Cached Aux Image");
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &tex,
+                texture: &rt.tex,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -1958,17 +1968,8 @@ impl GpuCompositor {
                 depth_or_array_layers: 1,
             },
         );
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let rt_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        map.insert(
-            path.to_string(),
-            RenderTarget {
-                tex,
-                view,
-                width: w,
-                height: h,
-            },
-        );
+        let rt_view = rt.tex.create_view(&wgpu::TextureViewDescriptor::default());
+        map.insert(path.to_string(), rt);
         Some(rt_view)
     }
 }

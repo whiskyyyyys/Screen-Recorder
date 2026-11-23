@@ -5,7 +5,7 @@ use obs_filters::{
     AudioFilterInstance, AudioFilterKind, ChromaKeyPreset, ExpanderPreset, MaskBlendType,
     NoiseSuppressionMethod, VideoFilterInstance, VideoFilterKind,
 };
-use obs_scenes::{AudioMonitoringType, SourceKind, SourceProperties};
+use obs_scenes::{AudioMonitoringType, SceneCollection, SourceKind, SourceProperties};
 use obs_settings::{
     AppSettings, OutputMode, RecordingFormat, RecordingQualityPreset, StreamProtocol, ThemeMode,
 };
@@ -440,15 +440,29 @@ fn render_tab_output(ui: &mut Ui, s: &mut AppSettings, backend: &dyn StudioBacke
             ui.add(egui::DragValue::new(&mut s.output.stream_keyint_sec).range(1..=10));
             ui.end_row();
 
-            ui.label("Preset:");
-            egui::ComboBox::from_id_salt("str_preset")
-                .selected_text(&s.output.stream_preset)
-                .show_ui(ui, |ui| {
-                    for p in ["speed", "balanced", "quality"] {
-                        ui.selectable_value(&mut s.output.stream_preset, p.to_string(), p);
-                    }
-                });
+            ui.label("Audio Track (1-6):");
+            if s.output.mode == OutputMode::Simple {
+                ui.label(format!("Track {}", s.output.stream_audio_track));
+            } else {
+                ui.add(egui::DragValue::new(&mut s.output.stream_audio_track).range(1..=6));
+            }
             ui.end_row();
+
+            if s.output.mode == OutputMode::Advanced {
+                ui.label("Rate Control:");
+                egui::ComboBox::from_id_salt("str_rc")
+                    .selected_text(&s.output.stream_rate_control)
+                    .show_ui(ui, |ui| {
+                        for rc in ["CBR", "VBR"] {
+                            ui.selectable_value(
+                                &mut s.output.stream_rate_control,
+                                rc.to_string(),
+                                rc,
+                            );
+                        }
+                    });
+                ui.end_row();
+            }
         });
 
     ui.separator();
@@ -488,21 +502,6 @@ fn render_tab_output(ui: &mut Ui, s: &mut AppSettings, backend: &dyn StudioBacke
                 });
             ui.end_row();
 
-            ui.label("Quality Preset:");
-            egui::ComboBox::from_id_salt("rec_qual")
-                .selected_text(s.output.rec_quality_preset.display_name())
-                .show_ui(ui, |ui| {
-                    for q in [
-                        RecordingQualityPreset::SameAsStream,
-                        RecordingQualityPreset::HighQuality,
-                        RecordingQualityPreset::Indistinguishable,
-                        RecordingQualityPreset::Lossless,
-                    ] {
-                        ui.selectable_value(&mut s.output.rec_quality_preset, q, q.display_name());
-                    }
-                });
-            ui.end_row();
-
             ui.label("Recording Encoder:");
             let sel_rec = available_encoders
                 .iter()
@@ -517,6 +516,94 @@ fn render_tab_output(ui: &mut Ui, s: &mut AppSettings, backend: &dyn StudioBacke
                     }
                 });
             ui.end_row();
+
+            if s.output.mode == OutputMode::Simple {
+                ui.label("Quality Preset:");
+                egui::ComboBox::from_id_salt("rec_qual")
+                    .selected_text(s.output.rec_quality_preset.display_name())
+                    .show_ui(ui, |ui| {
+                        for q in [
+                            RecordingQualityPreset::SameAsStream,
+                            RecordingQualityPreset::HighQuality,
+                            RecordingQualityPreset::Indistinguishable,
+                            RecordingQualityPreset::Lossless,
+                        ] {
+                            ui.selectable_value(
+                                &mut s.output.rec_quality_preset,
+                                q,
+                                q.display_name(),
+                            );
+                        }
+                    });
+                ui.end_row();
+            } else {
+                ui.label("Audio Encoder:");
+                egui::ComboBox::from_id_salt("rec_aenc")
+                    .selected_text(if s.output.rec_audio_encoder == "libopus" {
+                        "Opus (libopus)"
+                    } else {
+                        "AAC (aac)"
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut s.output.rec_audio_encoder,
+                            "aac".to_string(),
+                            "AAC (aac)",
+                        );
+                        ui.selectable_value(
+                            &mut s.output.rec_audio_encoder,
+                            "libopus".to_string(),
+                            "Opus (libopus)",
+                        );
+                    });
+                ui.end_row();
+
+                ui.label("Rate Control:");
+                egui::ComboBox::from_id_salt("rec_rc")
+                    .selected_text(&s.output.rec_rate_control)
+                    .show_ui(ui, |ui| {
+                        for rc in ["CQP", "CBR", "VBR"] {
+                            ui.selectable_value(&mut s.output.rec_rate_control, rc.to_string(), rc);
+                        }
+                    });
+                ui.end_row();
+
+                if s.output.rec_rate_control == "CQP" {
+                    ui.label("CRF / CQ Level:");
+                    ui.add(egui::Slider::new(&mut s.output.rec_crf, 0..=40));
+                    ui.end_row();
+                } else {
+                    ui.label("Video Bitrate (Kbps):");
+                    ui.add(
+                        egui::DragValue::new(&mut s.output.rec_bitrate_kbps)
+                            .range(1000..=100000)
+                            .speed(250),
+                    );
+                    ui.end_row();
+                }
+
+                ui.label("Encoder Preset:");
+                egui::ComboBox::from_id_salt("rec_preset")
+                    .selected_text(&s.output.rec_preset)
+                    .show_ui(ui, |ui| {
+                        for p in ["speed", "balanced", "quality"] {
+                            ui.selectable_value(&mut s.output.rec_preset, p.to_string(), p);
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Keyframe Interval (s):");
+                ui.add(egui::DragValue::new(&mut s.output.rec_keyint_sec).range(1..=10));
+                ui.end_row();
+
+                ui.label("Audio Bitrate (Kbps):");
+                ui.add(
+                    egui::DragValue::new(&mut s.output.rec_audio_bitrate_kbps)
+                        .range(64..=320)
+                        .speed(16),
+                );
+                ui.end_row();
+            }
 
             ui.label("Audio Tracks:");
             ui.horizontal(|ui| {
@@ -732,6 +819,38 @@ fn render_tab_video(ui: &mut Ui, s: &mut AppSettings, backend: &dyn StudioBacken
                                 vc.fps_den = den;
                             }
                         }
+                    });
+                ui.end_row();
+
+                ui.label("Color Format:");
+                ui.label("NV12 (8-bit, 4:2:0) [GPU Compute]");
+                ui.end_row();
+
+                ui.label("Color Space:");
+                egui::ComboBox::from_id_salt("vid_cs_sel")
+                    .selected_text(vc.color_space.display_name())
+                    .show_ui(ui, |ui| {
+                        for cs in [
+                            ColorSpace::Rec709,
+                            ColorSpace::Rec601,
+                            ColorSpace::Rec2100Pq,
+                            ColorSpace::Rec2100Hlg,
+                        ] {
+                            ui.selectable_value(&mut vc.color_space, cs, cs.display_name());
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Color Range:");
+                egui::ComboBox::from_id_salt("vid_cr_sel")
+                    .selected_text(vc.color_range.display_name())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut vc.color_range,
+                            ColorRange::Partial,
+                            "Limited (16-235)",
+                        );
+                        ui.selectable_value(&mut vc.color_range, ColorRange::Full, "Full (0-255)");
                     });
                 ui.end_row();
             });
@@ -1046,21 +1165,67 @@ pub fn render_source_properties_modal(
                     monitor_index,
                     capture_cursor,
                     force_gdi,
+                    capture_method,
+                    force_sdr,
                 } => {
+                    if *force_gdi && capture_method == "Auto" {
+                        *capture_method = "GDI".to_string();
+                    }
                     let mons = backend.enumerate_monitors();
                     let cur_lbl = mons
                         .get(*monitor_index)
                         .map(|m| m.display_label())
                         .unwrap_or_else(|| format!("Display {}", *monitor_index + 1));
-                    egui::ComboBox::from_label("Display")
-                        .selected_text(cur_lbl)
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_label("Display")
+                            .selected_text(cur_lbl)
+                            .show_ui(ui, |ui| {
+                                for m in &mons {
+                                    ui.selectable_value(monitor_index, m.index, m.display_label());
+                                }
+                            });
+                        if ui.button("Refresh").clicked() {
+                            ctx.request_repaint();
+                        }
+                    });
+                    egui::ComboBox::from_label("Capture Method")
+                        .selected_text(match capture_method.as_str() {
+                            "DXGI" => "DXGI Desktop Duplication",
+                            "GDI" => "GDI BitBlt (Compatibility)",
+                            _ => "Automatic (DXGI + GDI Fallback)",
+                        })
                         .show_ui(ui, |ui| {
-                            for m in &mons {
-                                ui.selectable_value(monitor_index, m.index, m.display_label());
-                            }
+                            ui.selectable_value(
+                                capture_method,
+                                "Auto".to_string(),
+                                "Automatic (DXGI + GDI Fallback)",
+                            );
+                            ui.selectable_value(
+                                capture_method,
+                                "DXGI".to_string(),
+                                "DXGI Desktop Duplication",
+                            );
+                            ui.selectable_value(
+                                capture_method,
+                                "GDI".to_string(),
+                                "GDI BitBlt (Compatibility)",
+                            );
                         });
+                    *force_gdi = capture_method == "GDI";
+                    ui.label("Color Format: RGBA8 (sRGB) -> GPU NV12");
                     ui.checkbox(capture_cursor, "Capture Cursor");
-                    ui.checkbox(force_gdi, "Compatibility Mode (GDI BitBlt instead of DXGI)");
+                    ui.checkbox(
+                        force_sdr,
+                        "Force SDR (Automatic tone-mapping on HDR displays)",
+                    );
+                    ui.horizontal(|ui| {
+                        if let Some((sw, sh)) = backend.source_dimensions(source_id) {
+                            ui.small(format!("Active Capture Size: {sw}x{sh}"));
+                        }
+                        if ui.button("Fit to Canvas").clicked() {
+                            fit_source_items_to_canvas(backend, source_id);
+                        }
+                    });
                 }
                 SourceProperties::WindowCapture {
                     window_title,
@@ -1068,28 +1233,86 @@ pub fn render_source_properties_modal(
                     pid,
                     capture_cursor,
                     client_area_only,
+                    capture_method,
+                    match_priority,
                 } => {
                     let wins = backend.enumerate_windows();
-                    egui::ComboBox::from_label("Window")
-                        .selected_text(if window_title.is_empty() {
-                            "Select Window..."
-                        } else {
-                            window_title.as_str()
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_label("Window")
+                            .selected_text(if window_title.is_empty() {
+                                "Select Window..."
+                            } else {
+                                window_title.as_str()
+                            })
+                            .show_ui(ui, |ui| {
+                                for w in &wins {
+                                    if ui
+                                        .selectable_label(*window_title == w.title, w.display_label())
+                                        .clicked()
+                                    {
+                                        *window_title = w.title.clone();
+                                        *process_name = w.process_name.clone();
+                                        *pid = w.pid;
+                                    }
+                                }
+                            });
+                        if ui.button("Refresh").clicked() {
+                            ctx.request_repaint();
+                        }
+                    });
+                    egui::ComboBox::from_label("Capture Method")
+                        .selected_text(capture_method.as_str())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                capture_method,
+                                "Auto".to_string(),
+                                "Automatic (PrintWindow + BitBlt Fallback)",
+                            );
+                            ui.selectable_value(
+                                capture_method,
+                                "PrintWindow".to_string(),
+                                "Windows PrintWindow (Works when occluded)",
+                            );
+                            ui.selectable_value(
+                                capture_method,
+                                "BitBlt".to_string(),
+                                "Win32 BitBlt",
+                            );
+                        });
+                    egui::ComboBox::from_label("Window Match Priority")
+                        .selected_text(match match_priority.as_str() {
+                            "ExactTitle" => "Window title must match",
+                            "ExeOnly" => "Match executable name",
+                            _ => "Match title, otherwise executable",
                         })
                         .show_ui(ui, |ui| {
-                            for w in &wins {
-                                if ui
-                                    .selectable_label(*window_title == w.title, w.display_label())
-                                    .clicked()
-                                {
-                                    *window_title = w.title.clone();
-                                    *process_name = w.process_name.clone();
-                                    *pid = w.pid;
-                                }
-                            }
+                            ui.selectable_value(
+                                match_priority,
+                                "TitleThenExe".to_string(),
+                                "Match title, otherwise executable",
+                            );
+                            ui.selectable_value(
+                                match_priority,
+                                "ExactTitle".to_string(),
+                                "Window title must match",
+                            );
+                            ui.selectable_value(
+                                match_priority,
+                                "ExeOnly".to_string(),
+                                "Match executable name",
+                            );
                         });
+                    ui.label("Color Format: RGBA8 (sRGB)");
                     ui.checkbox(capture_cursor, "Capture Cursor");
                     ui.checkbox(client_area_only, "Client Area");
+                    ui.horizontal(|ui| {
+                        if let Some((sw, sh)) = backend.source_dimensions(source_id) {
+                            ui.small(format!("Active Capture Size: {sw}x{sh}"));
+                        }
+                        if ui.button("Fit to Canvas").clicked() {
+                            fit_source_items_to_canvas(backend, source_id);
+                        }
+                    });
                 }
                 SourceProperties::GameCapture {
                     mode,
@@ -1098,9 +1321,17 @@ pub fn render_source_properties_modal(
                     pid,
                     capture_cursor,
                     force_scaling,
+                    capture_method,
+                    scale_width,
+                    scale_height,
+                    force_sdr,
                 } => {
                     egui::ComboBox::from_label("Mode")
-                        .selected_text(mode.as_str())
+                        .selected_text(if mode == "SpecificWindow" {
+                            "Capture specific window"
+                        } else {
+                            "Capture any fullscreen application"
+                        })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 mode,
@@ -1114,33 +1345,86 @@ pub fn render_source_properties_modal(
                             );
                         });
                     if mode == "SpecificWindow" {
+                        let self_pid = std::process::id();
                         let wins = backend.enumerate_windows();
-                        egui::ComboBox::from_label("Window")
-                            .selected_text(if window_title.is_empty() {
-                                "Select Game/Window..."
-                            } else {
-                                window_title.as_str()
-                            })
-                            .show_ui(ui, |ui| {
-                                for w in &wins {
-                                    if ui
-                                        .selectable_label(
-                                            *window_title == w.title,
-                                            w.display_label(),
-                                        )
-                                        .clicked()
-                                    {
-                                        *window_title = w.title.clone();
-                                        *process_name = w.process_name.clone();
-                                        *pid = w.pid;
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_label("Window")
+                                .selected_text(if window_title.is_empty() {
+                                    "Select Game/Window..."
+                                } else {
+                                    window_title.as_str()
+                                })
+                                .show_ui(ui, |ui| {
+                                    for w in wins.iter().filter(|w| w.pid != self_pid) {
+                                        if ui
+                                            .selectable_label(
+                                                *window_title == w.title,
+                                                w.display_label(),
+                                            )
+                                            .clicked()
+                                        {
+                                            *window_title = w.title.clone();
+                                            *process_name = w.process_name.clone();
+                                            *pid = w.pid;
+                                        }
                                     }
-                                }
-                            });
+                                });
+                            if ui.button("Refresh").clicked() {
+                                ctx.request_repaint();
+                            }
+                        });
                     }
+                    egui::ComboBox::from_label("Capture Method")
+                        .selected_text(match capture_method.as_str() {
+                            "DXGI" => "DXGI Desktop Duplication (Best FPS)",
+                            "WindowCapture" => "PrintWindow / BitBlt",
+                            _ => "Automatic (DXGI Foreground + PrintWindow)",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                capture_method,
+                                "Auto".to_string(),
+                                "Automatic (DXGI Foreground + PrintWindow)",
+                            );
+                            ui.selectable_value(
+                                capture_method,
+                                "DXGI".to_string(),
+                                "DXGI Desktop Duplication (Best FPS)",
+                            );
+                            ui.selectable_value(
+                                capture_method,
+                                "WindowCapture".to_string(),
+                                "PrintWindow / BitBlt",
+                            );
+                        });
+                    ui.label("Color Format: RGBA8 (sRGB) -> GPU NV12");
                     ui.checkbox(capture_cursor, "Capture Cursor");
+                    ui.checkbox(force_sdr, "Force SDR (HDR game compatibility)");
                     ui.checkbox(force_scaling, "Force Scaling");
+                    if *force_scaling {
+                        ui.horizontal(|ui| {
+                            ui.label("Scale Resolution:");
+                            ui.add(egui::DragValue::new(scale_width).range(160..=3840).speed(2));
+                            ui.label("x");
+                            ui.add(egui::DragValue::new(scale_height).range(120..=2160).speed(2));
+                            for (rw, rh) in [(1920, 1080), (1280, 720), (2560, 1440)] {
+                                if ui.small_button(format!("{rw}x{rh}")).clicked() {
+                                    *scale_width = rw;
+                                    *scale_height = rh;
+                                }
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        if let Some((sw, sh)) = backend.source_dimensions(source_id) {
+                            ui.small(format!("Active Capture Size: {sw}x{sh}"));
+                        }
+                        if ui.button("Fit to Canvas").clicked() {
+                            fit_source_items_to_canvas(backend, source_id);
+                        }
+                    });
                     ui.small(
-                        "Uses non-invasive DXGI/PrintWindow capture (no DLL swapchain hooking).",
+                        "Uses monitor-matched non-invasive DXGI + PrintWindow fallback (works with anti-cheat games).",
                     );
                 }
                 SourceProperties::VideoCaptureDevice {
@@ -1499,6 +1783,36 @@ pub fn render_source_properties_modal(
     if !open {
         *source_id_opt = None;
     }
+}
+
+fn fit_items_recursive(
+    items: &mut [obs_scenes::SceneItem],
+    source_id: SourceId,
+    src_size: [f32; 2],
+    canvas: [f32; 2],
+) {
+    for it in items {
+        if it.source_id == source_id {
+            SceneCollection::fit_item_to_canvas(&mut it.transform, src_size, canvas);
+        }
+        if let Some(children) = &mut it.group_children {
+            fit_items_recursive(children, source_id, src_size, canvas);
+        }
+    }
+}
+
+fn fit_source_items_to_canvas(backend: &dyn StudioBackend, source_id: SourceId) {
+    let (cw, ch) = backend.canvas_size();
+    let canvas = [cw as f32, ch as f32];
+    let src_size = backend
+        .source_dimensions(source_id)
+        .map(|(w, h)| [w as f32, h as f32])
+        .unwrap_or(canvas);
+    backend.with_collection_mut(&mut |c| {
+        for sc in &mut c.scenes {
+            fit_items_recursive(&mut sc.items, source_id, src_size, canvas);
+        }
+    });
 }
 
 pub fn render_filters_modal(

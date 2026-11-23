@@ -8,6 +8,7 @@ license.workspace = true
 obs-core.workspace = true
 obs-video.workspace = true
 obs-settings.workspace = true
+obs-platform-windows = { path = "../platform-windows" }
 obs-encoder = { path = "../encoder" }
 parking_lot.workspace = true
 crossbeam-channel.workspace = true

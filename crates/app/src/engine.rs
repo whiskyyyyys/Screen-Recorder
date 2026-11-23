@@ -7,8 +7,8 @@ use obs_encoder::{probe_all_encoders, resolve_best_video_encoder, EncoderProbeRe
 use obs_filters::db_to_linear;
 use obs_platform_windows::{
     enumerate_audio_devices, enumerate_monitors, enumerate_video_devices, enumerate_windows,
-    AudioDeviceInfo, AudioEndpointKind, HotkeyListener, MonitorInfo, VideoDeviceInfo,
-    WasapiRenderStream, WindowInfo,
+    AudioDeviceInfo, AudioEndpointKind, HighResTimerGuard, HotkeyListener, MonitorInfo,
+    VideoDeviceInfo, WasapiRenderStream, WindowInfo,
 };
 use obs_plugins::{PluginManager, PluginMetadata};
 use obs_recorder::{
@@ -27,7 +27,7 @@ use obs_ui::{StudioBackend, UiNotice};
 use obs_websocket::{
     start_websocket_server, WebSocketBackend, WebSocketConfig, WebSocketServerHandle,
 };
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -63,12 +63,16 @@ pub struct ObsEngine {
 
     audio_thread_running: Arc<AtomicBool>,
     audio_thread: Mutex<Option<JoinHandle<()>>>,
+    video_thread_running: Arc<AtomicBool>,
+    video_thread_wake: Arc<(Mutex<()>, Condvar)>,
+    video_thread: Mutex<Option<JoinHandle<()>>>,
 
     stats_snapshot: RwLock<EngineStats>,
     notice_seq: AtomicU64,
     notices: Mutex<VecDeque<UiNotice>>,
     last_frame_instant: Mutex<Instant>,
-    last_encode_instant: Mutex<Instant>,
+    last_transition_tick: Mutex<Instant>,
+    last_bg_program_render: Mutex<Option<Instant>>,
     render_time_ema: Mutex<f64>,
     fps_ema: Mutex<f64>,
     total_frames: Mutex<u64>,
@@ -155,11 +159,15 @@ impl ObsEngine {
             self_weak: Mutex::new(std::sync::Weak::new()),
             audio_thread_running: Arc::new(AtomicBool::new(true)),
             audio_thread: Mutex::new(None),
+            video_thread_running: Arc::new(AtomicBool::new(true)),
+            video_thread_wake: Arc::new((Mutex::new(()), Condvar::new())),
+            video_thread: Mutex::new(None),
             stats_snapshot: RwLock::new(EngineStats::default()),
             notice_seq: AtomicU64::new(0),
             notices: Mutex::new(VecDeque::with_capacity(16)),
             last_frame_instant: Mutex::new(Instant::now()),
-            last_encode_instant: Mutex::new(Instant::now()),
+            last_transition_tick: Mutex::new(Instant::now()),
+            last_bg_program_render: Mutex::new(None),
             render_time_ema: Mutex::new(0.0),
             fps_ema: Mutex::new(60.0),
             total_frames: Mutex::new(0),
@@ -169,6 +177,7 @@ impl ObsEngine {
         *engine.self_weak.lock() = Arc::downgrade(&engine);
         engine.install_plugin_hook_if_compositor();
         engine.start_audio_thread();
+        engine.start_video_output_thread();
         engine.start_hotkeys();
         if !headless {
             engine.restart_websocket_if_enabled();
@@ -237,6 +246,142 @@ impl ObsEngine {
             .sync_collection_with_transition(&col, tr_scenes);
     }
 
+    fn advance_active_transition(&self) {
+        let dt_ms = {
+            let mut last = self.last_transition_tick.lock();
+            let now = Instant::now();
+            let d = now.saturating_duration_since(*last).as_secs_f64() * 1000.0;
+            *last = now;
+            d.clamp(0.1, 250.0) as f32
+        };
+
+        let mut finished_to_scene: Option<(SceneId, String)> = None;
+        {
+            let mut tr_guard = self.active_transition.lock();
+            if let Some(tr) = tr_guard.as_mut() {
+                if !tr.manual_t_bar && tr.advance(dt_ms) {
+                    finished_to_scene = Some((tr.to_scene, tr.config.name.clone()));
+                    *tr_guard = None;
+                }
+            }
+        }
+        if let Some((new_prog, tr_name)) = finished_to_scene {
+            let sname = {
+                let mut col = self.collection.write();
+                let old_prog = col.active_scene_id;
+                col.active_scene_id = new_prog;
+                if self.root_state.read().studio_mode {
+                    col.preview_scene_id = Some(old_prog);
+                }
+                col.scene_by_id(new_prog)
+                    .map(|s| s.name.clone())
+                    .unwrap_or_default()
+            };
+            self.events
+                .publish(EngineEvent::TransitionEnded { name: tr_name });
+            self.events.publish(EngineEvent::SceneSwitched {
+                scene_id: new_prog,
+                scene_name: sname,
+            });
+            self.sync_active_sources();
+        }
+    }
+
+    fn start_video_output_thread(self: &Arc<Self>) {
+        let eng = Arc::clone(self);
+        let running = Arc::clone(&self.video_thread_running);
+        let wake = Arc::clone(&self.video_thread_wake);
+        let handle = thread::Builder::new()
+            .name("obs-video-output".to_string())
+            .spawn(move || {
+                let mut _timer: Option<HighResTimerGuard> = None;
+                let mut next_due: Option<Instant> = None;
+
+                while running.load(Ordering::Relaxed) {
+                    let rec_active = eng
+                        .recorder
+                        .lock()
+                        .as_ref()
+                        .map(|r| !r.is_paused())
+                        .unwrap_or(false);
+                    let stream_active = eng.streamer.lock().is_some();
+                    let replay_active = eng.replay_buf.lock().is_some();
+
+                    if !rec_active && !stream_active && !replay_active {
+                        _timer = None;
+                        next_due = None;
+                        *eng.last_bg_program_render.lock() = None;
+                        let mut g = wake.0.lock();
+                        let _ = wake.1.wait_for(&mut g, Duration::from_millis(25));
+                        continue;
+                    }
+
+                    if _timer.is_none() {
+                        _timer = Some(HighResTimerGuard::new(1));
+                    }
+
+                    let target_fps = eng.settings.read().video.config.fps_f64().clamp(1.0, 240.0);
+                    let frame_dur = Duration::from_secs_f64(1.0 / target_fps);
+                    let due = next_due.unwrap_or_else(Instant::now);
+                    let now = Instant::now();
+                    if now < due {
+                        let rem = due - now;
+                        if rem > Duration::from_millis(2) {
+                            let mut g = wake.0.lock();
+                            let _ = wake.1.wait_for(&mut g, rem - Duration::from_millis(2));
+                        } else {
+                            thread::sleep(Duration::from_micros(400));
+                        }
+                        continue;
+                    }
+
+                    let after_wait = Instant::now();
+                    if after_wait > due + Duration::from_millis(250) {
+                        next_due = Some(after_wait + frame_dur);
+                    } else {
+                        next_due = Some(due + frame_dur);
+                    }
+
+                    eng.advance_active_transition();
+                    let col = eng.collection.read().clone();
+                    let frames = eng.source_mgr.collect_video_frames(&col);
+                    let tr_opt = eng.active_transition.lock().clone();
+
+                    let nv12_arc: Option<Arc<Vec<u8>>> = {
+                        let mut comp_guard = eng.compositor.lock();
+                        comp_guard
+                            .as_mut()
+                            .and_then(|comp| {
+                                comp.render_frame(
+                                    &col,
+                                    &frames,
+                                    tr_opt.as_ref(),
+                                    false,
+                                    false,
+                                    true,
+                                )
+                            })
+                            .map(|slice| Arc::new(slice.to_vec()))
+                    };
+
+                    if let Some(nv12) = nv12_arc {
+                        *eng.last_bg_program_render.lock() = Some(Instant::now());
+                        if let Some(rec) = eng.recorder.lock().as_ref() {
+                            rec.push_video_nv12_shared(Arc::clone(&nv12));
+                        }
+                        if let Some(st) = eng.streamer.lock().as_ref() {
+                            st.push_video_nv12_shared(Arc::clone(&nv12));
+                        }
+                        if let Some(rb) = eng.replay_buf.lock().as_ref() {
+                            rb.push_video_nv12_shared(nv12);
+                        }
+                    }
+                }
+            })
+            .ok();
+        *self.video_thread.lock() = handle;
+    }
+
     fn start_audio_thread(self: &Arc<Self>) {
         let eng = Arc::clone(self);
         let running = Arc::clone(&self.audio_thread_running);
@@ -245,11 +390,20 @@ impl ObsEngine {
             .spawn(move || {
                 let mut monitor_dev_id = String::new();
                 let mut monitor_out: Option<WasapiRenderStream> = None;
+                let mut _timer: Option<HighResTimerGuard> = None;
+                let mut next_due = Instant::now() + Duration::from_millis(20);
 
                 while running.load(Ordering::Relaxed) {
+                    if eng.is_output_active() {
+                        if _timer.is_none() {
+                            _timer = Some(HighResTimerGuard::new(1));
+                        }
+                    } else {
+                        _timer = None;
+                    }
+
                     let sr = eng.audio_mixer.sample_rate();
                     let block_frames = ((sr as u64 * 20) / 1000) as usize; // 20ms block
-                    let t0 = Instant::now();
                     let block = eng.audio_mixer.mix_block(block_frames);
 
                     // Monitoring audio output via WASAPI if any audio is active
@@ -294,10 +448,14 @@ impl ObsEngine {
                         rb.push_audio_f32(&block.tracks[0]);
                     }
 
-                    let elapsed = t0.elapsed();
-                    let target = Duration::from_millis(20);
-                    if elapsed < target {
-                        thread::sleep(target - elapsed);
+                    let now = Instant::now();
+                    if now < next_due {
+                        thread::sleep(next_due - now);
+                    }
+                    next_due += Duration::from_millis(20);
+                    let after = Instant::now();
+                    if after > next_due + Duration::from_millis(250) {
+                        next_due = after + Duration::from_millis(20);
                     }
                 }
             })
@@ -531,88 +689,33 @@ impl StudioBackend for ObsEngine {
             d.max(0.1)
         };
 
-        // Advance active transition if running
-        let mut finished_to_scene: Option<(SceneId, String)> = None;
-        {
-            let mut tr_guard = self.active_transition.lock();
-            if let Some(tr) = tr_guard.as_mut() {
-                if !tr.manual_t_bar && tr.advance(dt_ms as f32) {
-                    finished_to_scene = Some((tr.to_scene, tr.config.name.clone()));
-                    *tr_guard = None;
-                }
-            }
-        }
-        if let Some((new_prog, tr_name)) = finished_to_scene {
-            let sname = {
-                let mut col = self.collection.write();
-                let old_prog = col.active_scene_id;
-                col.active_scene_id = new_prog;
-                if self.root_state.read().studio_mode {
-                    col.preview_scene_id = Some(old_prog);
-                }
-                col.scene_by_id(new_prog)
-                    .map(|s| s.name.clone())
-                    .unwrap_or_default()
-            };
-            self.events
-                .publish(EngineEvent::TransitionEnded { name: tr_name });
-            self.events.publish(EngineEvent::SceneSwitched {
-                scene_id: new_prog,
-                scene_name: sname,
-            });
-            self.sync_active_sources();
-        }
-
-        let col = self.collection.read().clone();
-        let frames = self.source_mgr.collect_video_frames(&col);
-
-        let rec_active = self
-            .recorder
+        let bg_rendering = self
+            .last_bg_program_render
             .lock()
-            .as_ref()
-            .map(|r| !r.is_paused())
+            .map(|t| t.elapsed() < Duration::from_millis(80))
             .unwrap_or(false);
-        let stream_active = self.streamer.lock().is_some();
-        let replay_active = self.replay_buf.lock().is_some();
-        let any_output = rec_active || stream_active || replay_active;
+        if !bg_rendering {
+            self.advance_active_transition();
+        }
 
         let target_interval_us = self.settings.read().video.config.frame_interval_us();
-        let should_push_encode = if any_output {
-            let mut last_enc = self.last_encode_instant.lock();
-            if last_enc.elapsed().as_micros() as u64 >= target_interval_us.saturating_sub(1500) {
-                *last_enc = t_start;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-
         let studio = self.root_state.read().studio_mode;
-        let tr_opt = self.active_transition.lock().clone();
 
         let (adapter_name, backend_name) = {
             let mut comp_guard = self.compositor.lock();
             if let Some(comp) = comp_guard.as_mut() {
-                let nv12_opt = comp.render_frame(
-                    &col,
-                    &frames,
-                    tr_opt.as_ref(),
-                    studio,
-                    render_multiview,
-                    should_push_encode,
-                );
-                if let Some(nv12) = nv12_opt {
-                    if let Some(rec) = self.recorder.lock().as_ref() {
-                        rec.push_video_nv12(nv12);
-                    }
-                    if let Some(st) = self.streamer.lock().as_ref() {
-                        st.push_video_nv12(nv12);
-                    }
-                    if let Some(rb) = self.replay_buf.lock().as_ref() {
-                        rb.push_video_nv12(nv12);
-                    }
+                if !bg_rendering || studio || render_multiview {
+                    let col = self.collection.read().clone();
+                    let frames = self.source_mgr.collect_video_frames(&col);
+                    let tr_opt = self.active_transition.lock().clone();
+                    let _ = comp.render_frame(
+                        &col,
+                        &frames,
+                        tr_opt.as_ref(),
+                        studio,
+                        render_multiview,
+                        false,
+                    );
                 }
                 (
                     comp.adapter_name().to_string(),
@@ -694,21 +797,21 @@ impl StudioBackend for ObsEngine {
         self.compositor
             .lock()
             .as_ref()
-            .map(|c| c.program_view().clone())
+            .map(|c| c.program_egui_view().clone())
     }
 
     fn preview_texture_view(&self) -> Option<wgpu::TextureView> {
         self.compositor
             .lock()
             .as_ref()
-            .map(|c| c.preview_view().clone())
+            .map(|c| c.preview_egui_view().clone())
     }
 
     fn multiview_texture_view(&self) -> Option<wgpu::TextureView> {
         self.compositor
             .lock()
             .as_ref()
-            .map(|c| c.multiview_view().clone())
+            .map(|c| c.multiview_egui_view().clone())
     }
 
     fn canvas_size(&self) -> (u32, u32) {
@@ -1152,6 +1255,7 @@ impl StudioBackend for ObsEngine {
         .map_err(|e| e.to_string())?;
 
         *self.recorder.lock() = Some(session);
+        self.video_thread_wake.1.notify_all();
         self.events.publish(EngineEvent::RecordStateChanged {
             state: RecordState::Recording,
             output_path: Some(out_path.to_string_lossy().to_string()),
@@ -1180,6 +1284,7 @@ impl StudioBackend for ObsEngine {
             .ok_or_else(|| "Recording is not active".to_string())?;
         let state = if rec.is_paused() {
             rec.resume();
+            self.video_thread_wake.1.notify_all();
             RecordState::Recording
         } else {
             rec.pause();
@@ -1238,6 +1343,7 @@ impl StudioBackend for ObsEngine {
         .map_err(|e| e.to_string())?;
 
         *self.streamer.lock() = Some(sess);
+        self.video_thread_wake.1.notify_all();
         self.events.publish(EngineEvent::StreamStateChanged {
             state: StreamState::Connecting,
             error: None,
@@ -1294,6 +1400,7 @@ impl StudioBackend for ObsEngine {
         .map_err(|e| e.to_string())?;
 
         *self.replay_buf.lock() = Some(rb);
+        self.video_thread_wake.1.notify_all();
         self.events.publish(EngineEvent::ReplayBufferStateChanged {
             state: ReplayBufferState::Active,
         });
@@ -1549,6 +1656,11 @@ impl StudioBackend for ObsEngine {
 
     fn shutdown(&self) {
         self.save_active_collection();
+        self.video_thread_running.store(false, Ordering::Relaxed);
+        self.video_thread_wake.1.notify_all();
+        if let Some(h) = self.video_thread.lock().take() {
+            let _ = h.join();
+        }
         if let Some(rec) = self.recorder.lock().take() {
             let _ = rec.stop();
         }

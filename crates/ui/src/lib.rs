@@ -17,7 +17,7 @@ use obs_core::{
     RecordState, ReplayBufferState, SceneId, SceneItemId, SourceId, StreamState, TransitionId,
 };
 use obs_scenes::{SceneCollection, SceneItem, SourceKind};
-use obs_settings::ThemeMode;
+use obs_settings::{RecordingFormat, ThemeMode};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -558,7 +558,7 @@ impl ObsDesktopApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(toast) = self.status_toast.current().cloned() {
                         if ui
-                            .small_button("×")
+                            .small_button("x")
                             .on_hover_text("Dismiss notification")
                             .clicked()
                         {
@@ -1332,7 +1332,7 @@ impl<'a> ObsTabViewer<'a> {
                     let is_sel = sc.id == selected_id;
                     let is_prog = sc.id == col.active_scene_id;
                     let label = if studio && is_prog {
-                        format!("● {} [LIVE]", sc.name)
+                        format!("[LIVE] {}", sc.name)
                     } else {
                         sc.name.clone()
                     };
@@ -1386,10 +1386,12 @@ impl<'a> ObsTabViewer<'a> {
                 let _ = self.app.backend.duplicate_scene(selected_id);
             }
             if let Some(idx) = col.scenes.iter().position(|s| s.id == selected_id) {
-                if idx > 0 && ui.button("↑").clicked() {
+                if idx > 0 && ui.button("Up").on_hover_text("Move Scene Up").clicked() {
                     self.app.backend.move_scene(idx, idx - 1);
                 }
-                if idx + 1 < col.scenes.len() && ui.button("↓").clicked() {
+                if idx + 1 < col.scenes.len()
+                    && ui.button("Dn").on_hover_text("Move Scene Down").clicked()
+                {
                     self.app.backend.move_scene(idx, idx + 1);
                 }
             }
@@ -1511,14 +1513,14 @@ impl<'a> ObsTabViewer<'a> {
                     "Group",
                 );
             }
-            if ui.button("↑").on_hover_text("Move Layer Up").clicked() {
+            if ui.button("Up").on_hover_text("Move Layer Up").clicked() {
                 if let Some(&id) = self.app.selected_items.first() {
                     self.app.backend.with_collection_mut(&mut |c| {
                         let _ = c.move_item_step(target_scene_id, id, 1);
                     });
                 }
             }
-            if ui.button("↓").on_hover_text("Move Layer Down").clicked() {
+            if ui.button("Dn").on_hover_text("Move Layer Down").clicked() {
                 if let Some(&id) = self.app.selected_items.first() {
                     self.app.backend.with_collection_mut(&mut |c| {
                         let _ = c.move_item_step(target_scene_id, id, -1);
@@ -1816,7 +1818,7 @@ impl<'a> ObsTabViewer<'a> {
 
         ui.horizontal(|ui| {
             let rec_w = if recording {
-                (btn_w - 42.0).max(80.0)
+                (btn_w - 48.0).max(80.0)
             } else {
                 btn_w
             };
@@ -1846,9 +1848,9 @@ impl<'a> ObsTabViewer<'a> {
                 }
             }
             if recording {
-                let p_lbl = if paused { "▶" } else { "⏸" };
+                let p_lbl = if paused { "Go" } else { "||" };
                 if ui
-                    .add_sized([36.0, 28.0], egui::Button::new(p_lbl))
+                    .add_sized([42.0, 28.0], egui::Button::new(p_lbl))
                     .on_hover_text(if paused {
                         "Resume Recording"
                     } else {
@@ -1916,6 +1918,37 @@ impl<'a> ObsTabViewer<'a> {
             });
         if ui.add(st_btn).clicked() {
             self.app.backend.set_studio_mode(!studio);
+        }
+
+        // Quick recording format selector right in Controls dock
+        {
+            let mut cur_settings = self.app.backend.settings();
+            let mut sel_fmt = cur_settings.output.rec_format;
+            ui.horizontal(|ui| {
+                ui.label("Format:");
+                ui.add_enabled_ui(!recording, |ui| {
+                    egui::ComboBox::from_id_salt("ctrl_rec_fmt")
+                        .width((btn_w - 58.0).max(80.0))
+                        .selected_text(format!(".{}", sel_fmt.extension().to_uppercase()))
+                        .show_ui(ui, |ui| {
+                            for f in [
+                                RecordingFormat::Mkv,
+                                RecordingFormat::Mp4,
+                                RecordingFormat::FragmentedMp4,
+                                RecordingFormat::Mov,
+                                RecordingFormat::Flv,
+                            ] {
+                                ui.selectable_value(&mut sel_fmt, f, f.display_name());
+                            }
+                        });
+                });
+            });
+            if sel_fmt != cur_settings.output.rec_format {
+                cur_settings.output.rec_format = sel_fmt;
+                if let Err(e) = self.app.backend.apply_settings(cur_settings) {
+                    self.app.status_toast.push_error(e);
+                }
+            }
         }
 
         if ui

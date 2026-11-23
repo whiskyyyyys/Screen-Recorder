@@ -18,19 +18,27 @@ enum CaptureSpec {
     Display {
         monitor_index: usize,
         capture_cursor: bool,
-        force_gdi: bool,
+        capture_method: String,
+        force_sdr: bool,
     },
     Window {
         title: String,
         process: String,
         capture_cursor: bool,
         client_area_only: bool,
+        capture_method: String,
+        match_priority: String,
     },
     Game {
         mode: String,
         title: String,
         process: String,
         capture_cursor: bool,
+        capture_method: String,
+        force_scaling: bool,
+        scale_width: u32,
+        scale_height: u32,
+        force_sdr: bool,
     },
     Webcam {
         device_id: String,
@@ -58,12 +66,22 @@ impl CaptureSpec {
                     monitor_index,
                     capture_cursor,
                     force_gdi,
+                    capture_method,
+                    force_sdr,
                 },
-            ) => Some(Self::Display {
-                monitor_index: *monitor_index,
-                capture_cursor: *capture_cursor,
-                force_gdi: *force_gdi,
-            }),
+            ) => {
+                let effective_method = if *force_gdi && capture_method == "Auto" {
+                    "GDI".to_string()
+                } else {
+                    capture_method.clone()
+                };
+                Some(Self::Display {
+                    monitor_index: *monitor_index,
+                    capture_cursor: *capture_cursor,
+                    capture_method: effective_method,
+                    force_sdr: *force_sdr,
+                })
+            }
             (
                 SourceKind::WindowCapture,
                 SourceProperties::WindowCapture {
@@ -71,6 +89,8 @@ impl CaptureSpec {
                     process_name,
                     capture_cursor,
                     client_area_only,
+                    capture_method,
+                    match_priority,
                     ..
                 },
             ) => Some(Self::Window {
@@ -78,6 +98,8 @@ impl CaptureSpec {
                 process: process_name.clone(),
                 capture_cursor: *capture_cursor,
                 client_area_only: *client_area_only,
+                capture_method: capture_method.clone(),
+                match_priority: match_priority.clone(),
             }),
             (
                 SourceKind::GameCapture,
@@ -86,6 +108,11 @@ impl CaptureSpec {
                     window_title,
                     process_name,
                     capture_cursor,
+                    force_scaling,
+                    capture_method,
+                    scale_width,
+                    scale_height,
+                    force_sdr,
                     ..
                 },
             ) => Some(Self::Game {
@@ -93,6 +120,11 @@ impl CaptureSpec {
                 title: window_title.clone(),
                 process: process_name.clone(),
                 capture_cursor: *capture_cursor,
+                capture_method: capture_method.clone(),
+                force_scaling: *force_scaling,
+                scale_width: *scale_width,
+                scale_height: *scale_height,
+                force_sdr: *force_sdr,
             }),
             (
                 SourceKind::VideoCaptureDevice,
@@ -281,9 +313,15 @@ fn run_worker_loop(
         CaptureSpec::Display {
             monitor_index,
             capture_cursor,
-            force_gdi,
+            capture_method,
+            force_sdr,
         } => {
-            let mut cap = match DisplayCapturer::new(monitor_index, capture_cursor, force_gdi) {
+            let mut cap = match DisplayCapturer::new_with_options(
+                monitor_index,
+                capture_cursor,
+                &capture_method,
+                force_sdr,
+            ) {
                 Ok(c) => c,
                 Err(e) => {
                     *last_error.lock() = Some(e.to_string());
@@ -315,8 +353,17 @@ fn run_worker_loop(
             process,
             capture_cursor,
             client_area_only,
+            capture_method,
+            match_priority,
         } => {
-            let mut cap = WindowCapturer::new(title, process, capture_cursor, client_area_only);
+            let mut cap = WindowCapturer::new_with_options(
+                title,
+                process,
+                capture_cursor,
+                client_area_only,
+                capture_method,
+                match_priority,
+            );
             while running.load(Ordering::Relaxed) {
                 let fps = (*fps_arc.lock()).clamp(10, 60);
                 let interval = Duration::from_millis((1000 / fps).max(8) as u64);
@@ -342,8 +389,23 @@ fn run_worker_loop(
             title,
             process,
             capture_cursor,
+            capture_method,
+            force_scaling,
+            scale_width,
+            scale_height,
+            force_sdr,
         } => {
-            let mut cap = GameCapturer::new(mode, title, process, capture_cursor);
+            let mut cap = GameCapturer::new_with_options(
+                mode,
+                title,
+                process,
+                capture_cursor,
+                capture_method,
+                force_scaling,
+                scale_width,
+                scale_height,
+                force_sdr,
+            );
             while running.load(Ordering::Relaxed) {
                 let fps = (*fps_arc.lock()).clamp(10, 120);
                 let interval = Duration::from_millis((1000 / fps).max(4) as u64);

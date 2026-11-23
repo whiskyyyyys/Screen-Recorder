@@ -135,12 +135,36 @@ impl SourceKind {
     }
 }
 
+fn default_capture_method_auto() -> String {
+    "Auto".to_string()
+}
+
+fn default_match_priority() -> String {
+    "TitleThenExe".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_scale_width() -> u32 {
+    1920
+}
+
+fn default_scale_height() -> u32 {
+    1080
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SourceProperties {
     DisplayCapture {
         monitor_index: usize,
         capture_cursor: bool,
         force_gdi: bool,
+        #[serde(default = "default_capture_method_auto")]
+        capture_method: String, // "Auto" | "DXGI" | "GDI"
+        #[serde(default = "default_true")]
+        force_sdr: bool,
     },
     WindowCapture {
         window_title: String,
@@ -148,6 +172,10 @@ pub enum SourceProperties {
         pid: u32,
         capture_cursor: bool,
         client_area_only: bool,
+        #[serde(default = "default_capture_method_auto")]
+        capture_method: String, // "Auto" | "PrintWindow" | "BitBlt"
+        #[serde(default = "default_match_priority")]
+        match_priority: String, // "TitleThenExe" | "ExactTitle" | "ExeOnly"
     },
     GameCapture {
         mode: String, // "AnyFullscreen" | "SpecificWindow"
@@ -156,6 +184,14 @@ pub enum SourceProperties {
         pid: u32,
         capture_cursor: bool,
         force_scaling: bool,
+        #[serde(default = "default_capture_method_auto")]
+        capture_method: String, // "Auto" | "DXGI" | "WindowCapture"
+        #[serde(default = "default_scale_width")]
+        scale_width: u32,
+        #[serde(default = "default_scale_height")]
+        scale_height: u32,
+        #[serde(default = "default_true")]
+        force_sdr: bool,
     },
     VideoCaptureDevice {
         device_id: String,
@@ -249,6 +285,8 @@ impl SourceProperties {
                 monitor_index: 0,
                 capture_cursor: true,
                 force_gdi: false,
+                capture_method: default_capture_method_auto(),
+                force_sdr: true,
             },
             SourceKind::WindowCapture => Self::WindowCapture {
                 window_title: String::new(),
@@ -256,6 +294,8 @@ impl SourceProperties {
                 pid: 0,
                 capture_cursor: true,
                 client_area_only: true,
+                capture_method: default_capture_method_auto(),
+                match_priority: default_match_priority(),
             },
             SourceKind::GameCapture => Self::GameCapture {
                 mode: "AnyFullscreen".to_string(),
@@ -264,6 +304,10 @@ impl SourceProperties {
                 pid: 0,
                 capture_cursor: true,
                 force_scaling: false,
+                capture_method: default_capture_method_auto(),
+                scale_width: 1920,
+                scale_height: 1080,
+                force_sdr: true,
             },
             SourceKind::VideoCaptureDevice => Self::VideoCaptureDevice {
                 device_id: "default".to_string(),
@@ -564,4 +608,49 @@ pub fn global_audio_slot_order(id: SourceId) -> Option<usize> {
 
 pub fn is_global_audio_source_id(id: SourceId) -> bool {
     global_audio_slot_order(id).is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_v011_source_properties_deserialize_with_defaults() {
+        let legacy_display =
+            r#"{"DisplayCapture":{"monitor_index":1,"capture_cursor":true,"force_gdi":false}}"#;
+        let dp: SourceProperties = serde_json::from_str(legacy_display).unwrap();
+        match dp {
+            SourceProperties::DisplayCapture {
+                monitor_index,
+                capture_method,
+                force_sdr,
+                ..
+            } => {
+                assert_eq!(monitor_index, 1);
+                assert_eq!(capture_method, "Auto");
+                assert!(force_sdr);
+            }
+            _ => panic!("Expected DisplayCapture"),
+        }
+
+        let legacy_game = r#"{"GameCapture":{"mode":"SpecificWindow","window_title":"Roblox","process_name":"RobloxPlayerBeta.exe","pid":42,"capture_cursor":true,"force_scaling":true}}"#;
+        let gp: SourceProperties = serde_json::from_str(legacy_game).unwrap();
+        match gp {
+            SourceProperties::GameCapture {
+                capture_method,
+                scale_width,
+                scale_height,
+                force_sdr,
+                force_scaling,
+                ..
+            } => {
+                assert_eq!(capture_method, "Auto");
+                assert!(force_scaling);
+                assert_eq!(scale_width, 1920);
+                assert_eq!(scale_height, 1080);
+                assert!(force_sdr);
+            }
+            _ => panic!("Expected GameCapture"),
+        }
+    }
 }

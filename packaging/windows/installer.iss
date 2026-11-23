@@ -1,6 +1,6 @@
 ; OxideStudio (OBS-Rust) Windows x64 Installer Script (Inno Setup 6)
 #define AppName "OxideStudio (OBS-Rust)"
-#define AppVersion "0.1.1"
+#define AppVersion "0.1.2"
 #define AppPublisher "OxideStudio Contributors"
 #define AppURL "https://github.com/whiskyyyyys/Screen-Recorder"
 #define AppExeName "obs-rust.exe"

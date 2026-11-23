@@ -11,7 +11,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
     DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
@@ -33,19 +36,37 @@ struct DxgiState {
     staging: Option<ID3D11Texture2D>,
     staging_w: u32,
     staging_h: u32,
+    staging_format: DXGI_FORMAT,
 }
 
 pub struct DisplayCapturer {
     monitor: MonitorInfo,
     capture_cursor: bool,
+    capture_method: String,
     force_gdi: bool,
+    force_sdr: bool,
     dxgi: Option<DxgiState>,
+    dxgi_unsupported_hdr: bool,
     seq: u64,
     last_rgba: Option<VideoFrame>,
 }
 
 impl DisplayCapturer {
     pub fn new(monitor_index: usize, capture_cursor: bool, force_gdi: bool) -> Result<Self> {
+        Self::new_with_options(
+            monitor_index,
+            capture_cursor,
+            if force_gdi { "GDI" } else { "Auto" },
+            true,
+        )
+    }
+
+    pub fn new_with_options(
+        monitor_index: usize,
+        capture_cursor: bool,
+        capture_method: &str,
+        force_sdr: bool,
+    ) -> Result<Self> {
         let monitors = enumerate_monitors();
         let monitor = monitors
             .get(monitor_index)
@@ -53,6 +74,7 @@ impl DisplayCapturer {
             .or_else(|| monitors.into_iter().next())
             .ok_or_else(|| ObsError::Capture("No monitors found".to_string()))?;
 
+        let force_gdi = capture_method.eq_ignore_ascii_case("GDI");
         let dxgi = if !force_gdi {
             Self::init_dxgi(&monitor).ok()
         } else {
@@ -62,8 +84,11 @@ impl DisplayCapturer {
         Ok(Self {
             monitor,
             capture_cursor,
+            capture_method: capture_method.to_string(),
             force_gdi,
+            force_sdr,
             dxgi,
+            dxgi_unsupported_hdr: false,
             seq: 0,
             last_rgba: None,
         })
@@ -71,6 +96,18 @@ impl DisplayCapturer {
 
     pub fn monitor(&self) -> &MonitorInfo {
         &self.monitor
+    }
+
+    pub fn last_frame(&self) -> Option<VideoFrame> {
+        self.last_rgba.clone()
+    }
+
+    pub fn active_backend_name(&self) -> &'static str {
+        if self.force_gdi || self.dxgi.is_none() || self.dxgi_unsupported_hdr {
+            "GDI BitBlt"
+        } else {
+            "DXGI Desktop Duplication"
+        }
     }
 
     fn init_dxgi(monitor: &MonitorInfo) -> Result<DxgiState> {
@@ -132,6 +169,7 @@ impl DisplayCapturer {
                                 staging: None,
                                 staging_w: 0,
                                 staging_h: 0,
+                                staging_format: DXGI_FORMAT_B8G8R8A8_UNORM,
                             });
                         }
                     }
@@ -146,40 +184,48 @@ impl DisplayCapturer {
 
     /// Captures a frame as RGBA8. Returns `Ok(Some(frame))` on new or cached frame, falling back to GDI if needed.
     pub fn capture_frame(&mut self, timeout_ms: u32, pts_us: u64) -> Result<Option<VideoFrame>> {
-        if !self.force_gdi && self.dxgi.is_none() {
+        if !self.force_gdi && !self.dxgi_unsupported_hdr && self.dxgi.is_none() {
             self.dxgi = Self::init_dxgi(&self.monitor).ok();
         }
 
-        if let Some(dxgi) = self.dxgi.as_mut() {
-            match Self::capture_dxgi(
-                dxgi,
-                &self.monitor,
-                self.capture_cursor,
-                timeout_ms,
-                pts_us,
-                &mut self.seq,
-            ) {
-                Ok(Some(frame)) => {
-                    self.last_rgba = Some(frame.clone());
-                    return Ok(Some(frame));
-                }
-                Ok(None) => {
-                    // Timeout: no screen changes since last frame; return cached latest frame if available
-                    if self.last_rgba.is_some() {
-                        return Ok(None);
+        if !self.force_gdi && !self.dxgi_unsupported_hdr {
+            if let Some(dxgi) = self.dxgi.as_mut() {
+                match Self::capture_dxgi(
+                    dxgi,
+                    &self.monitor,
+                    self.capture_cursor,
+                    self.force_sdr,
+                    timeout_ms,
+                    pts_us,
+                    &mut self.seq,
+                ) {
+                    Ok(Some(frame)) => {
+                        self.last_rgba = Some(frame.clone());
+                        return Ok(Some(frame));
                     }
-                    // Initial capture had no desktop change yet -> grab one GDI frame immediately
-                }
-                Err(AccessStatus::AccessLost) => {
-                    if let Ok(new_dupl) = unsafe { dxgi.output1.DuplicateOutput(&dxgi.device) } {
-                        dxgi.dupl = new_dupl;
-                    } else {
+                    Ok(None) => {
+                        if self.last_rgba.is_some() {
+                            return Ok(None);
+                        }
+                    }
+                    Err(AccessStatus::AccessLost) => {
+                        if let Ok(new_dupl) = unsafe { dxgi.output1.DuplicateOutput(&dxgi.device) }
+                        {
+                            dxgi.dupl = new_dupl;
+                        } else {
+                            self.dxgi = None;
+                        }
+                    }
+                    Err(AccessStatus::UnsupportedFormat) => {
+                        self.dxgi_unsupported_hdr = true;
+                        self.dxgi = None;
+                    }
+                    Err(AccessStatus::Other(_)) => {
                         self.dxgi = None;
                     }
                 }
-                Err(AccessStatus::Other(_)) => {
-                    self.dxgi = None;
-                }
+            } else if self.capture_method.eq_ignore_ascii_case("DXGI") && self.last_rgba.is_some() {
+                return Ok(None);
             }
         }
 
@@ -192,6 +238,7 @@ impl DisplayCapturer {
         dxgi: &mut DxgiState,
         monitor: &MonitorInfo,
         capture_cursor: bool,
+        force_sdr: bool,
         timeout_ms: u32,
         pts_us: u64,
         seq: &mut u64,
@@ -230,16 +277,26 @@ impl DisplayCapturer {
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             tex.GetDesc(&mut desc);
 
+            let is_bgra = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM
+                || desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+            let is_rgba = desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM
+                || desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            if !is_bgra && !is_rgba {
+                let _ = force_sdr;
+                return Err(AccessStatus::UnsupportedFormat);
+            }
+
             if dxgi.staging.is_none()
                 || dxgi.staging_w != desc.Width
                 || dxgi.staging_h != desc.Height
+                || dxgi.staging_format != desc.Format
             {
                 let staging_desc = D3D11_TEXTURE2D_DESC {
                     Width: desc.Width,
                     Height: desc.Height,
                     MipLevels: 1,
                     ArraySize: 1,
-                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    Format: desc.Format,
                     SampleDesc: desc.SampleDesc,
                     Usage: D3D11_USAGE_STAGING,
                     BindFlags: 0,
@@ -253,6 +310,7 @@ impl DisplayCapturer {
                 dxgi.staging = st;
                 dxgi.staging_w = desc.Width;
                 dxgi.staging_h = desc.Height;
+                dxgi.staging_format = desc.Format;
             }
 
             let staging = dxgi
@@ -270,8 +328,23 @@ impl DisplayCapturer {
             let h = desc.Height;
             let total_bytes = (mapped.RowPitch as usize) * (h as usize);
             let slice = std::slice::from_raw_parts(mapped.pData as *const u8, total_bytes);
-            let mut rgba = bgra_to_rgba_vec(slice, w, h, mapped.RowPitch);
+            let mut rgba = if is_bgra {
+                bgra_to_rgba_vec(slice, w, h, mapped.RowPitch)
+            } else {
+                let row_bytes = (w as usize) * 4;
+                let mut out = vec![0u8; row_bytes * (h as usize)];
+                for row in 0..h as usize {
+                    let s = row * (mapped.RowPitch as usize);
+                    let d = row * row_bytes;
+                    out[d..d + row_bytes].copy_from_slice(&slice[s..s + row_bytes]);
+                }
+                out
+            };
             dxgi.context.Unmap(staging, 0);
+
+            for px in rgba.as_chunks_mut::<4>().0 {
+                px[3] = 255;
+            }
 
             if capture_cursor {
                 overlay_cursor_on_rgba(&mut rgba, w, h, monitor.left, monitor.top);
@@ -376,6 +449,7 @@ impl DisplayCapturer {
 
 enum AccessStatus {
     AccessLost,
+    UnsupportedFormat,
     Other(#[allow(dead_code)] String),
 }
 

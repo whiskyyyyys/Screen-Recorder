@@ -294,3 +294,95 @@ fn engine_locks_output_format_settings_while_recording_active() {
     let _ = std::fs::remove_file(recorded);
     let _ = std::fs::remove_dir_all(&tmp_rec_dir);
 }
+
+#[test]
+fn cfr_recording_maintains_realtime_duration_under_half_rate_input() {
+    let tmp_dir = std::env::temp_dir().join("obs_rust_cfr_pacer_test");
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let mkv_path = tmp_dir.join("half_rate_cfr.mkv");
+    let _ = std::fs::remove_file(&mkv_path);
+
+    let session = RecordingSession::start(RecordingConfig {
+        output_path: mkv_path.clone(),
+        format: RecordingFormat::Mkv,
+        width: 320,
+        height: 240,
+        fps: 30,
+        sample_rate: 48000,
+        video_encoder: "libx264".to_string(),
+        audio_encoder: "aac".to_string(),
+        rate_control: "CBR".to_string(),
+        bitrate_kbps: 1500,
+        crf: 22,
+        preset: "speed".to_string(),
+        keyint_sec: 1,
+        audio_track_mask: 0b0000_0001,
+        audio_bitrate_kbps: 128,
+        color_space: ColorSpace::Rec709,
+        color_range: ColorRange::Partial,
+        auto_remux_to_mp4: false,
+    })
+    .expect("RecordingSession::start failed");
+
+    // Simulate 2.0 real seconds where UI/capture only supplies frames at ~15 FPS (every 66.7ms)
+    // while audio arrives at real-time 20ms cadence. Without CFR pacing, the output video would
+    // play back at ~2x speed (~1.0s duration instead of ~2.0s).
+    let audio_20ms = vec![0.02f32; 960 * 2];
+    let tracks = [
+        audio_20ms,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ];
+
+    let start = std::time::Instant::now();
+    let mut step = 0u8;
+    let mut next_video = std::time::Duration::ZERO;
+    let mut next_audio = std::time::Duration::ZERO;
+    let target_dur = std::time::Duration::from_secs(2);
+
+    while start.elapsed() < target_dur {
+        let elapsed = start.elapsed();
+        if elapsed >= next_video {
+            session.push_video_nv12(&synthetic_nv12_frame(320, 240, step));
+            step = step.wrapping_add(1);
+            next_video += std::time::Duration::from_micros(66_667);
+        }
+        if elapsed >= next_audio {
+            session.push_audio_tracks(&tracks);
+            next_audio += std::time::Duration::from_millis(20);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let out_mkv = session.stop().expect("Stop CFR recording failed");
+    let probe = ffprobe_json(&out_mkv);
+    let container_dur_s: f64 = probe["format"]["duration"]
+        .as_str()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
+    let streams = probe["streams"].as_array().unwrap();
+    let parse_stream_dur = |codec_type: &str| -> f64 {
+        streams
+            .iter()
+            .find(|s| s["codec_type"] == codec_type)
+            .and_then(|s| s["duration"].as_str().and_then(|d| d.parse::<f64>().ok()))
+            .unwrap_or(container_dur_s)
+    };
+    let v_dur_s = parse_stream_dur("video");
+    let a_dur_s = parse_stream_dur("audio");
+
+    assert!(
+        (1.60..=2.50).contains(&container_dur_s),
+        "Expected ~2.0s real-time MKV duration despite 15fps input into 30fps session, got {container_dur_s:.3}s (v={v_dur_s:.3}s, a={a_dur_s:.3}s)"
+    );
+    assert!(
+        (v_dur_s - a_dur_s).abs() < 0.45,
+        "Expected aligned A/V durations (~2.0s), got v={v_dur_s:.3}s, a={a_dur_s:.3}s"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

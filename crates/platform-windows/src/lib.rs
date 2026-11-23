@@ -21,3 +21,25 @@ pub use window_capture::{enumerate_windows, WindowCapturer, WindowInfo};
 
 #[doc(hidden)]
 pub use window_capture::{spawn_test_capture_window, TestWindowHandle};
+
+/// RAII guard enabling high-resolution Windows multimedia timer ticks (`timeBeginPeriod`).
+/// Ensures monotonic real-time CFR pacing loops don't drift from the default 15.6ms timer tick.
+pub struct HighResTimerGuard(u32);
+
+impl HighResTimerGuard {
+    pub fn new(period_ms: u32) -> Self {
+        let p = period_ms.clamp(1, 16);
+        unsafe {
+            windows::Win32::Media::timeBeginPeriod(p);
+        }
+        Self(p)
+    }
+}
+
+impl Drop for HighResTimerGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::Media::timeEndPeriod(self.0);
+        }
+    }
+}

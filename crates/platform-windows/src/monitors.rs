@@ -87,3 +87,34 @@ pub fn enumerate_monitors() -> Vec<MonitorInfo> {
     }
     list
 }
+
+/// Finds the monitor index containing the center of `[left, top, right, bottom]` or greatest overlap.
+pub fn monitor_index_for_rect(left: i32, top: i32, right: i32, bottom: i32) -> usize {
+    let mons = enumerate_monitors();
+    if mons.is_empty() {
+        return 0;
+    }
+    let cx = left + (right - left) / 2;
+    let cy = top + (bottom - top) / 2;
+    if let Some(m) = mons.iter().find(|m| {
+        cx >= m.left
+            && cx < m.left + (m.width as i32)
+            && cy >= m.top
+            && cy < m.top + (m.height as i32)
+    }) {
+        return m.index;
+    }
+
+    mons.iter()
+        .max_by_key(|m| {
+            let ix0 = left.max(m.left);
+            let iy0 = top.max(m.top);
+            let ix1 = right.min(m.left + (m.width as i32));
+            let iy1 = bottom.min(m.top + (m.height as i32));
+            let iw = (ix1 - ix0).max(0) as i64;
+            let ih = (iy1 - iy0).max(0) as i64;
+            iw * ih
+        })
+        .map(|m| m.index)
+        .unwrap_or(0)
+}

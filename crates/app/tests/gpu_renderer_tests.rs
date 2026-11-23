@@ -126,3 +126,71 @@ fn gpu_compositor_chroma_key_transition_and_nv12_readback() {
     );
     let _ = SourceId::new();
 }
+
+#[test]
+fn dark_srgb_surface_preserves_luma_and_provides_srgb_egui_views() {
+    let cfg = VideoConfig {
+        canvas_width: 128,
+        canvas_height: 128,
+        output_width: 128,
+        output_height: 128,
+        fps_num: 30,
+        fps_den: 1,
+        ..Default::default()
+    };
+    let mut comp = GpuCompositor::new_headless(cfg).expect("Headless wgpu GPU must initialize");
+
+    let mut col = SceneCollection::default_starter("DarkSrgbCheck");
+    let s1 = col.active_scene_id;
+    // Exact dark OxideStudio UI color #16181E that previously washed out via double-gamma in egui
+    let dark_px = [22u8, 24, 30, 255];
+    let (dark_id, _) = col
+        .create_source_and_add(
+            s1,
+            "DarkBg",
+            SourceKind::ColorSource,
+            SourceProperties::ColorSource {
+                color_rgba: dark_px,
+                width: 128,
+                height: 128,
+            },
+        )
+        .unwrap();
+    col.scene_by_id_mut(s1).unwrap().items = vec![SceneItem::new(dark_id)];
+
+    let mut frames = HashMap::new();
+    frames.insert(dark_id, VideoFrame::new_solid_rgba(128, 128, dark_px, 1));
+
+    let nv12 = comp
+        .render_frame(&col, &frames, None, true, true, true)
+        .expect("NV12 readback expected")
+        .to_vec();
+
+    // Ensure sRGB display views exist for Program, Preview, and Multiview
+    let _ = comp.program_egui_view();
+    let _ = comp.preview_egui_view();
+    let _ = comp.multiview_egui_view();
+
+    let rgba = comp.read_program_rgba().unwrap();
+    let mid_idx = (64 * 128 + 64) * 4;
+    let (r, g, b, a) = (
+        rgba[mid_idx],
+        rgba[mid_idx + 1],
+        rgba[mid_idx + 2],
+        rgba[mid_idx + 3],
+    );
+    assert!(
+        (r as i16 - 22).abs() <= 1
+            && (g as i16 - 24).abs() <= 1
+            && (b as i16 - 30).abs() <= 1
+            && a == 255,
+        "Expected exact dark #16181E RGBA without washout, got ({r},{g},{b},{a})"
+    );
+
+    // Rec.709 Partial luma for (22, 24, 30) ~= 16 + (0.2126*22 + 0.7152*24 + 0.0722*30)/255 * 219 ~= 37
+    let y_sample = nv12[64 * 128 + 64];
+    assert!(
+        (33..=41).contains(&y_sample),
+        "Expected dark Rec.709 Y luma ~37 without double-gamma brightening, got Y={y_sample}"
+    );
+}

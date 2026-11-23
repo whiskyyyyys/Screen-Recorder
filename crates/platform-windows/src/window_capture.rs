@@ -7,15 +7,15 @@ use std::path::Path;
 use std::ptr;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    BOOL, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Dwm::{
     DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS,
 };
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC, DeleteObject, GetDC,
-    ReleaseDC, SelectObject, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-    HBITMAP, HBRUSH, SRCCOPY,
+    BitBlt, ClientToScreen, CreateCompatibleDC, CreateDIBSection, CreateSolidBrush, DeleteDC,
+    DeleteObject, GetDC, ReleaseDC, SelectObject, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, DIB_RGB_COLORS, HBITMAP, HBRUSH, SRCCOPY,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -161,12 +161,66 @@ pub fn enumerate_windows() -> Vec<WindowInfo> {
     list
 }
 
+pub fn window_content_rect(hwnd: HWND, client_area_only: bool) -> Option<RECT> {
+    unsafe {
+        if client_area_only {
+            let mut client = RECT::default();
+            if GetClientRect(hwnd, &mut client).is_ok() {
+                let mut tl = POINT { x: 0, y: 0 };
+                if ClientToScreen(hwnd, &mut tl).as_bool() {
+                    let cw = (client.right - client.left).max(0);
+                    let ch = (client.bottom - client.top).max(0);
+                    if cw >= 8 && ch >= 8 {
+                        return Some(RECT {
+                            left: tl.x,
+                            top: tl.y,
+                            right: tl.x + cw,
+                            bottom: tl.y + ch,
+                        });
+                    }
+                }
+            }
+        }
+        let mut rect = RECT::default();
+        let got_rect = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut _,
+            size_of::<RECT>() as u32,
+        )
+        .is_ok()
+            || GetWindowRect(hwnd, &mut rect).is_ok();
+        if got_rect && rect.right - rect.left >= 8 && rect.bottom - rect.top >= 8 {
+            return Some(rect);
+        }
+    }
+    None
+}
+
+pub(crate) fn is_frame_all_black(rgba: &[u8]) -> bool {
+    let pixel_count = rgba.len() / 4;
+    if pixel_count == 0 {
+        return true;
+    }
+    let step = (pixel_count / 64).max(1);
+    for p in (0..pixel_count).step_by(step) {
+        let i = p * 4;
+        if rgba[i] > 2 || rgba[i + 1] > 2 || rgba[i + 2] > 2 {
+            return false;
+        }
+    }
+    true
+}
+
 pub struct WindowCapturer {
     hwnd: Option<HWND>,
     target_title: String,
     target_process: String,
     capture_cursor: bool,
     client_area_only: bool,
+    capture_method: String,
+    match_priority: String,
+    last_valid_frame: Option<VideoFrame>,
     seq: u64,
 }
 
@@ -177,12 +231,33 @@ impl WindowCapturer {
         capture_cursor: bool,
         client_area_only: bool,
     ) -> Self {
+        Self::new_with_options(
+            target_title,
+            target_process,
+            capture_cursor,
+            client_area_only,
+            "Auto".to_string(),
+            "TitleThenExe".to_string(),
+        )
+    }
+
+    pub fn new_with_options(
+        target_title: String,
+        target_process: String,
+        capture_cursor: bool,
+        client_area_only: bool,
+        capture_method: String,
+        match_priority: String,
+    ) -> Self {
         let mut cap = Self {
             hwnd: None,
             target_title,
             target_process,
             capture_cursor,
             client_area_only,
+            capture_method,
+            match_priority,
+            last_valid_frame: None,
             seq: 0,
         };
         cap.resolve_hwnd();
@@ -196,39 +271,62 @@ impl WindowCapturer {
             }
         }
         let wins = enumerate_windows();
-        let matched = wins.into_iter().find(|w| {
-            (!self.target_title.is_empty() && w.title == self.target_title)
-                || (!self.target_process.is_empty()
-                    && w.process_name.eq_ignore_ascii_case(&self.target_process))
-                || (!self.target_title.is_empty()
-                    && w.title
-                        .to_ascii_lowercase()
-                        .contains(&self.target_title.to_ascii_lowercase()))
-        });
+        let matched = match self.match_priority.as_str() {
+            "ExactTitle" => wins
+                .iter()
+                .find(|w| !self.target_title.is_empty() && w.title == self.target_title),
+            "ExeOnly" => wins.iter().find(|w| {
+                !self.target_process.is_empty()
+                    && w.process_name.eq_ignore_ascii_case(&self.target_process)
+            }),
+            _ => wins
+                .iter()
+                .find(|w| !self.target_title.is_empty() && w.title == self.target_title)
+                .or_else(|| {
+                    wins.iter().find(|w| {
+                        !self.target_process.is_empty()
+                            && w.process_name.eq_ignore_ascii_case(&self.target_process)
+                    })
+                })
+                .or_else(|| {
+                    wins.iter().find(|w| {
+                        !self.target_title.is_empty()
+                            && w.title
+                                .to_ascii_lowercase()
+                                .contains(&self.target_title.to_ascii_lowercase())
+                    })
+                }),
+        };
         self.hwnd = matched.map(|w| HWND(w.hwnd_raw as *mut std::ffi::c_void));
         self.hwnd
     }
 
     pub fn capture_frame(&mut self, pts_us: u64) -> Result<Option<VideoFrame>> {
         let Some(hwnd) = self.resolve_hwnd() else {
-            return Ok(None);
+            return Ok(self.last_valid_frame.clone());
         };
 
         unsafe {
             if IsIconic(hwnd).as_bool() {
-                return Ok(None);
+                return Ok(self.last_valid_frame.clone());
             }
 
             let mut rect = RECT::default();
+            let mut origin_pt = POINT::default();
             if self.client_area_only {
                 let _ = GetClientRect(hwnd, &mut rect);
+                let _ = ClientToScreen(hwnd, &mut origin_pt);
             } else {
                 let _ = GetWindowRect(hwnd, &mut rect);
+                origin_pt = POINT {
+                    x: rect.left,
+                    y: rect.top,
+                };
             }
             let w = (rect.right - rect.left).max(0);
             let h = (rect.bottom - rect.top).max(0);
             if w < 8 || h < 8 {
-                return Ok(None);
+                return Ok(self.last_valid_frame.clone());
             }
 
             let win_dc = GetDC(hwnd);
@@ -277,15 +375,30 @@ impl WindowCapturer {
             } else {
                 PRINT_WINDOW_FLAGS(2)
             };
-            let mut ok = PrintWindow(hwnd, mem_dc, pw_flags).as_bool();
-            if !ok {
-                ok = BitBlt(mem_dc, 0, 0, w, h, win_dc, 0, 0, SRCCOPY).is_ok();
-            }
+            let mut ok = match self.capture_method.as_str() {
+                "BitBlt" => BitBlt(mem_dc, 0, 0, w, h, win_dc, 0, 0, SRCCOPY).is_ok(),
+                "PrintWindow" => PrintWindow(hwnd, mem_dc, pw_flags).as_bool(),
+                _ => {
+                    let pw_ok = PrintWindow(hwnd, mem_dc, pw_flags).as_bool();
+                    if !pw_ok {
+                        BitBlt(mem_dc, 0, 0, w, h, win_dc, 0, 0, SRCCOPY).is_ok()
+                    } else if !bits_ptr.is_null() {
+                        let len = (w as usize) * (h as usize) * 4;
+                        let bgra = std::slice::from_raw_parts(bits_ptr as *const u8, len);
+                        if is_frame_all_black(bgra) {
+                            let blt_ok = BitBlt(mem_dc, 0, 0, w, h, win_dc, 0, 0, SRCCOPY).is_ok();
+                            blt_ok || pw_ok
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
+                    }
+                }
+            };
 
-            let mut win_screen_rect = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut win_screen_rect);
             if self.capture_cursor {
-                draw_cursor_on_dc(mem_dc, win_screen_rect.left, win_screen_rect.top);
+                draw_cursor_on_dc(mem_dc, origin_pt.x, origin_pt.y);
             }
 
             let frame = if ok && !bits_ptr.is_null() {
@@ -295,19 +408,24 @@ impl WindowCapturer {
                 for px in rgba.as_chunks_mut::<4>().0 {
                     px[3] = 255;
                 }
-                self.seq += 1;
-                Some(VideoFrame::new_rgba(
-                    w as u32, h as u32, rgba, pts_us, self.seq,
-                ))
+                if is_frame_all_black(&rgba) && self.last_valid_frame.is_some() {
+                    None
+                } else {
+                    self.seq += 1;
+                    let vf = VideoFrame::new_rgba(w as u32, h as u32, rgba, pts_us, self.seq);
+                    self.last_valid_frame = Some(vf.clone());
+                    Some(vf)
+                }
             } else {
                 None
             };
+            let _ = &mut ok;
 
             SelectObject(mem_dc, old);
             let _ = DeleteObject(dib);
             let _ = DeleteDC(mem_dc);
             let _ = ReleaseDC(hwnd, win_dc);
-            Ok(frame)
+            Ok(frame.or_else(|| self.last_valid_frame.clone()))
         }
     }
 }

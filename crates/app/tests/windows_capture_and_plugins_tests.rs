@@ -1,6 +1,6 @@
 use obs_platform_windows::{
     enumerate_audio_devices, enumerate_monitors, enumerate_windows, spawn_test_capture_window,
-    AudioEndpointKind, DisplayCapturer, WindowCapturer,
+    AudioEndpointKind, DisplayCapturer, GameCapturer, WindowCapturer,
 };
 use obs_plugins::PluginManager;
 use std::collections::HashMap;
@@ -103,5 +103,53 @@ fn dynamic_plugin_dll_loads_verifies_abi_and_processes_rgba() {
     assert!(
         center > corner + 40,
         "Expected vignette plugin to darken corners ({corner}) vs center ({center})"
+    );
+}
+
+#[test]
+fn game_capture_scales_output_and_retains_valid_frames() {
+    let target_title = "OxideStudio Game Capture Target";
+    let _test_win = spawn_test_capture_window(target_title)
+        .expect("Failed spawning Win32 target window for Game Capture test");
+    std::thread::sleep(Duration::from_millis(80));
+
+    let mut gc = GameCapturer::new_with_options(
+        "SpecificWindow".to_string(),
+        target_title.to_string(),
+        String::new(),
+        false,
+        "WindowCapture".to_string(),
+        true,
+        320,
+        180,
+        true,
+    );
+
+    let mut frame = None;
+    for attempt in 0..8u64 {
+        if let Some(f) = gc
+            .capture_frame((attempt + 1) * 33_333)
+            .expect("GameCapturer::capture_frame failed")
+        {
+            frame = Some(f);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    let gf = frame.expect("Expected GameCapturer to capture and scale target window");
+    assert_eq!(gf.width, 320);
+    assert_eq!(gf.height, 180);
+    assert_eq!(gf.data.len(), 320 * 180 * 4);
+    let mid = ((90 * 320 + 160) * 4) as usize;
+    let (r, g, b, a) = (
+        gf.data[mid],
+        gf.data[mid + 1],
+        gf.data[mid + 2],
+        gf.data[mid + 3],
+    );
+    assert!(
+        g > 150 && r < 80 && b < 80 && a == 255,
+        "Expected solid green scaled Game Capture center pixel, got rgba=({r},{g},{b},{a})"
     );
 }

@@ -9,9 +9,10 @@ use crossbeam_channel::{bounded, Sender};
 use named_pipe::{PipeCancelToken, WindowsNamedPipe};
 use obs_core::{ObsError, RecordState, RecordingStats, Result};
 use obs_encoder::{build_video_encoder_args, locate_ffmpeg, VideoEncodeParams};
+use obs_platform_windows::HighResTimerGuard;
 use obs_settings::RecordingFormat;
 use obs_video::{ColorRange, ColorSpace};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -21,6 +22,138 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+pub type SharedVideoSlot = Arc<(Mutex<Option<Arc<Vec<u8>>>>, Condvar)>;
+
+pub fn new_shared_video_slot() -> SharedVideoSlot {
+    Arc::new((Mutex::new(None), Condvar::new()))
+}
+
+pub fn publish_shared_video_frame(slot: &SharedVideoSlot, frame: Arc<Vec<u8>>) {
+    let mut guard = slot.0.lock();
+    *guard = Some(frame);
+    slot.1.notify_all();
+}
+
+/// Pumps latest NV12 frames into an FFmpeg rawvideo stdin pipe at strict monotonic wall-clock CFR,
+/// duplicating the latest frame during UI/capture slowdowns so output playback stays 1.0x speed.
+pub fn run_cfr_video_pipe_loop<W: Write>(
+    mut sink: W,
+    slot: SharedVideoSlot,
+    running: Arc<AtomicBool>,
+    paused: Option<Arc<AtomicBool>>,
+    fps: u32,
+    frames_written: Arc<AtomicU64>,
+    frames_dropped: Arc<AtomicU64>,
+) {
+    let _timer = HighResTimerGuard::new(1);
+    let frame_dur = Duration::from_secs_f64(1.0 / (fps.max(1) as f64));
+
+    // Wait for the very first frame (or cancellation on early shutdown)
+    let first_frame: Option<Arc<Vec<u8>>> = {
+        let mut guard = slot.0.lock();
+        while running.load(Ordering::Relaxed) {
+            if paused.as_ref().is_some_and(|p| p.load(Ordering::Relaxed)) {
+                let _ = slot.1.wait_for(&mut guard, Duration::from_millis(10));
+                continue;
+            }
+            if guard.is_some() {
+                break;
+            }
+            let _ = slot.1.wait_for(&mut guard, Duration::from_millis(10));
+        }
+        if running.load(Ordering::Relaxed) {
+            guard.clone()
+        } else {
+            None
+        }
+    };
+
+    let Some(f0) = first_frame else {
+        let _ = sink.flush();
+        return;
+    };
+    if sink.write_all(&f0).is_err() {
+        frames_dropped.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    frames_written.fetch_add(1, Ordering::Relaxed);
+
+    let mut next_due = Instant::now() + frame_dur;
+    let mut was_paused = false;
+
+    while running.load(Ordering::Relaxed) {
+        if paused.as_ref().is_some_and(|p| p.load(Ordering::Relaxed)) {
+            was_paused = true;
+            let mut guard = slot.0.lock();
+            let _ = slot.1.wait_for(&mut guard, Duration::from_millis(10));
+            continue;
+        }
+        if was_paused {
+            was_paused = false;
+            next_due = Instant::now() + frame_dur;
+        }
+
+        let frame_to_write: Option<Arc<Vec<u8>>> = {
+            loop {
+                if !running.load(Ordering::Relaxed) {
+                    break None;
+                }
+                if paused.as_ref().is_some_and(|p| p.load(Ordering::Relaxed)) {
+                    break None;
+                }
+                let now = Instant::now();
+                if now >= next_due {
+                    let guard = slot.0.lock();
+                    break guard.clone();
+                }
+                let rem = next_due - now;
+                if rem > Duration::from_millis(2) {
+                    let mut guard = slot.0.lock();
+                    let _ = slot.1.wait_for(&mut guard, rem - Duration::from_millis(2));
+                } else {
+                    thread::sleep(Duration::from_micros(400));
+                }
+            }
+        };
+
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        let Some(frame) = frame_to_write else {
+            continue;
+        };
+
+        let now = Instant::now();
+        let behind = now.saturating_duration_since(next_due);
+        let due_slots = 1u64 + (behind.as_secs_f64() / frame_dur.as_secs_f64()).floor() as u64;
+
+        let emit_count = if behind > Duration::from_millis(500) {
+            // Encoder stalled >500ms; credit missed slots and resync clock cleanly
+            frames_dropped.fetch_add(due_slots.saturating_sub(1), Ordering::Relaxed);
+            next_due = now + frame_dur;
+            1u64
+        } else {
+            let capped = due_slots.min(4);
+            if due_slots > capped {
+                frames_dropped.fetch_add(due_slots - capped, Ordering::Relaxed);
+            }
+            next_due += Duration::from_secs_f64(frame_dur.as_secs_f64() * (due_slots as f64));
+            capped
+        };
+
+        for _ in 0..emit_count {
+            if sink.write_all(&frame).is_err() {
+                frames_dropped.fetch_add(1, Ordering::Relaxed);
+                running.store(false, Ordering::Relaxed);
+                break;
+            }
+            frames_written.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let _ = sink.flush();
+}
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -78,7 +211,7 @@ pub fn expand_recording_filename(dir: &str, pattern: &str, format: RecordingForm
 pub struct RecordingSession {
     config: RecordingConfig,
     active_track_indices: Vec<usize>,
-    video_tx: Option<Sender<Vec<u8>>>,
+    video_slot: SharedVideoSlot,
     audio_txs: Vec<(usize, Sender<Vec<u8>>)>,
     running: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -209,7 +342,7 @@ impl RecordingSession {
             .spawn()
             .map_err(|e| ObsError::Recorder(format!("Failed spawning recorder FFmpeg: {e}")))?;
 
-        let mut stdin = child
+        let stdin = child
             .stdin
             .take()
             .ok_or_else(|| ObsError::Recorder("Missing recorder stdin".into()))?;
@@ -239,24 +372,26 @@ impl RecordingSession {
             );
         }
 
-        let (video_tx, video_rx) = bounded::<Vec<u8>>(12);
+        let video_slot = new_shared_video_slot();
+        let slot_vid = Arc::clone(&video_slot);
         let r_vid = Arc::clone(&running);
+        let p_vid = Arc::clone(&paused);
         let enc_frames = Arc::clone(&encoded_frames);
+        let skip_frames = Arc::clone(&skipped_frames);
+        let fps = config.fps.max(1);
         threads.push(
             thread::Builder::new()
                 .name("obs-rec-vid".into())
                 .spawn(move || {
-                    while let Ok(frame) = video_rx.recv() {
-                        if stdin.write_all(&frame).is_err() {
-                            break;
-                        }
-                        enc_frames.fetch_add(1, Ordering::Relaxed);
-                        if !r_vid.load(Ordering::Relaxed) && video_rx.is_empty() {
-                            break;
-                        }
-                    }
-                    let _ = stdin.flush();
-                    drop(stdin);
+                    run_cfr_video_pipe_loop(
+                        stdin,
+                        slot_vid,
+                        r_vid,
+                        Some(p_vid),
+                        fps,
+                        enc_frames,
+                        skip_frames,
+                    );
                 })
                 .map_err(ObsError::Io)?,
         );
@@ -292,7 +427,7 @@ impl RecordingSession {
         Ok(Self {
             config,
             active_track_indices,
-            video_tx: Some(video_tx),
+            video_slot,
             audio_txs,
             running,
             paused,
@@ -310,14 +445,14 @@ impl RecordingSession {
     }
 
     pub fn push_video_nv12(&self, nv12: &[u8]) {
+        self.push_video_nv12_shared(Arc::new(nv12.to_vec()));
+    }
+
+    pub fn push_video_nv12_shared(&self, nv12: Arc<Vec<u8>>) {
         if self.paused.load(Ordering::Relaxed) || !self.running.load(Ordering::Relaxed) {
             return;
         }
-        if let Some(tx) = &self.video_tx {
-            if tx.try_send(nv12.to_vec()).is_err() {
-                self.skipped_frames.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        publish_shared_video_frame(&self.video_slot, nv12);
     }
 
     pub fn push_audio_tracks(&self, tracks: &[Vec<f32>; 6]) {
@@ -339,6 +474,7 @@ impl RecordingSession {
         if !self.paused.swap(true, Ordering::SeqCst) {
             *self.pause_started.lock() = Some(Instant::now());
             *self.state.lock() = RecordState::Paused;
+            self.video_slot.1.notify_all();
         }
     }
 
@@ -348,6 +484,7 @@ impl RecordingSession {
                 *self.paused_accum.lock() += t.elapsed();
             }
             *self.state.lock() = RecordState::Recording;
+            self.video_slot.1.notify_all();
         }
     }
 
@@ -391,7 +528,7 @@ impl RecordingSession {
     fn stop_inner(&mut self) -> Result<PathBuf> {
         *self.state.lock() = RecordState::Stopping;
         self.running.store(false, Ordering::SeqCst);
-        self.video_tx.take();
+        self.video_slot.1.notify_all();
         self.audio_txs.clear();
 
         let mut child_status: Option<std::process::ExitStatus> = None;
