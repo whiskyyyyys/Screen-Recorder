@@ -267,6 +267,10 @@ impl RecordingSession {
             "-hide_banner",
             "-loglevel",
             "error",
+            "-probesize",
+            "32",
+            "-analyzeduration",
+            "1",
             "-f",
             "rawvideo",
             "-pix_fmt",
@@ -281,6 +285,10 @@ impl RecordingSession {
 
         for (_, pipe) in &pipes {
             cmd.args([
+                "-probesize",
+                "32",
+                "-analyzeduration",
+                "1",
                 "-f",
                 "f32le",
                 "-ar",

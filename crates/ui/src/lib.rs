@@ -321,43 +321,43 @@ impl ObsDesktopApp {
             return;
         };
         let canvas_size = self.backend.canvas_size();
-        if let Some(pv) = self.backend.program_texture_view() {
+        if let Some(pv) = (self.prog_tex_id.is_none() || self.prog_tex_size != canvas_size)
+            .then(|| self.backend.program_texture_view())
+            .flatten()
+        {
             let mut renderer = rs.renderer.write();
             if let Some(id) = self.prog_tex_id {
-                if self.prog_tex_size != canvas_size {
-                    renderer.update_egui_texture_from_wgpu_texture(
-                        &rs.device,
-                        &pv,
-                        wgpu::FilterMode::Linear,
-                        id,
-                    );
-                    self.prog_tex_size = canvas_size;
-                }
+                renderer.update_egui_texture_from_wgpu_texture(
+                    &rs.device,
+                    &pv,
+                    wgpu::FilterMode::Linear,
+                    id,
+                );
             } else {
                 let id =
                     renderer.register_native_texture(&rs.device, &pv, wgpu::FilterMode::Linear);
                 self.prog_tex_id = Some(id);
-                self.prog_tex_size = canvas_size;
             }
+            self.prog_tex_size = canvas_size;
         }
-        if let Some(prv) = self.backend.preview_texture_view() {
+        if let Some(prv) = (self.prev_tex_id.is_none() || self.prev_tex_size != canvas_size)
+            .then(|| self.backend.preview_texture_view())
+            .flatten()
+        {
             let mut renderer = rs.renderer.write();
             if let Some(id) = self.prev_tex_id {
-                if self.prev_tex_size != canvas_size {
-                    renderer.update_egui_texture_from_wgpu_texture(
-                        &rs.device,
-                        &prv,
-                        wgpu::FilterMode::Linear,
-                        id,
-                    );
-                    self.prev_tex_size = canvas_size;
-                }
+                renderer.update_egui_texture_from_wgpu_texture(
+                    &rs.device,
+                    &prv,
+                    wgpu::FilterMode::Linear,
+                    id,
+                );
             } else {
                 let id =
                     renderer.register_native_texture(&rs.device, &prv, wgpu::FilterMode::Linear);
                 self.prev_tex_id = Some(id);
-                self.prev_tex_size = canvas_size;
             }
+            self.prev_tex_size = canvas_size;
         }
         if self.mv_tex_id.is_none() {
             if let Some(mv) = self.backend.multiview_texture_view() {

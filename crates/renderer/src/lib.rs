@@ -674,7 +674,7 @@ impl GpuCompositor {
             }
         }
 
-        self.queue.submit(Some(encoder.finish()));
+        let submission = self.queue.submit(Some(encoder.finish()));
 
         if use_gpu_nv12 {
             let slice = self.nv12_staging_buf.slice(..);
@@ -682,7 +682,8 @@ impl GpuCompositor {
             slice.map_async(wgpu::MapMode::Read, move |res| {
                 let _ = tx.send(res);
             });
-            self.device.poll(wgpu::Maintain::Wait);
+            self.device
+                .poll(wgpu::Maintain::WaitForSubmissionIndex(submission));
             if let Ok(Ok(())) = rx.recv() {
                 let mapped = slice.get_mapped_range();
                 if mapped.len() == self.last_nv12.len() {

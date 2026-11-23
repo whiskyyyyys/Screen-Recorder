@@ -46,8 +46,9 @@ pub struct ObsEngine {
     audio_mixer: Arc<AudioMixer>,
     source_mgr: Arc<SourceManager>,
     compositor: Mutex<Option<GpuCompositor>>,
+    source_sizes: Mutex<HashMap<SourceId, (u32, u32)>>,
     plugin_mgr: Arc<PluginManager>,
-    encoder_report: RwLock<EncoderProbeReport>,
+    encoder_report: RwLock<Option<EncoderProbeReport>>,
     services: Vec<StreamingServiceEntry>,
 
     active_transition: Mutex<Option<ActiveTransition>>,
@@ -128,7 +129,7 @@ impl ObsEngine {
             None
         };
 
-        let encoder_report = probe_all_encoders();
+        let encoder_report = headless.then(probe_all_encoders);
         let services = load_streaming_services();
         let tokio_rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -145,6 +146,7 @@ impl ObsEngine {
             audio_mixer,
             source_mgr,
             compositor: Mutex::new(compositor),
+            source_sizes: Mutex::new(HashMap::new()),
             plugin_mgr,
             encoder_report: RwLock::new(encoder_report),
             services,
@@ -180,6 +182,19 @@ impl ObsEngine {
         engine.start_video_output_thread();
         engine.start_hotkeys();
         if !headless {
+            let weak = Arc::downgrade(&engine);
+            let result = thread::Builder::new()
+                .name("obs-encoder-probe".to_string())
+                .spawn(move || {
+                    let report = probe_all_encoders();
+                    if let Some(engine) = weak.upgrade() {
+                        engine.encoder_report.write().get_or_insert(report);
+                    }
+                });
+            if let Err(error) = result {
+                *engine.encoder_report.write() = Some(EncoderProbeReport::default());
+                engine.push_error_notice(format!("Could not detect encoders: {error}"));
+            }
             engine.restart_websocket_if_enabled();
         }
         engine
@@ -336,11 +351,8 @@ impl ObsEngine {
                     }
 
                     let after_wait = Instant::now();
-                    if after_wait > due + Duration::from_millis(250) {
-                        next_due = Some(after_wait + frame_dur);
-                    } else {
-                        next_due = Some(due + frame_dur);
-                    }
+                    // A late render cannot reconstruct missed source frames.
+                    next_due = Some((due + frame_dur).max(after_wait + frame_dur / 2));
 
                     eng.advance_active_transition();
                     let col = eng.collection.read().clone();
@@ -702,8 +714,8 @@ impl StudioBackend for ObsEngine {
         let studio = self.root_state.read().studio_mode;
 
         let (adapter_name, backend_name) = {
-            let mut comp_guard = self.compositor.lock();
-            if let Some(comp) = comp_guard.as_mut() {
+            let mut comp_guard = self.compositor.try_lock();
+            if let Some(comp) = comp_guard.as_mut().and_then(|guard| guard.as_mut()) {
                 if !bg_rendering || studio || render_multiview {
                     let col = self.collection.read().clone();
                     let frames = self.source_mgr.collect_video_frames(&col);
@@ -722,7 +734,8 @@ impl StudioBackend for ObsEngine {
                     comp.backend_name().to_string(),
                 )
             } else {
-                (String::new(), String::new())
+                let stats = self.stats_snapshot.read();
+                (stats.gpu_adapter_name.clone(), stats.gpu_backend.clone())
             }
         };
 
@@ -773,8 +786,12 @@ impl StudioBackend for ObsEngine {
             .unwrap_or(0);
 
         let report = self.encoder_report.read();
-        let active_enc =
-            resolve_best_video_encoder(&self.settings.read().output.rec_video_encoder, &report);
+        let active_enc = report.as_ref().map_or_else(
+            || "Detecting encoders…".to_string(),
+            |report| {
+                resolve_best_video_encoder(&self.settings.read().output.rec_video_encoder, report)
+            },
+        );
 
         let mut stats = self.stats_snapshot.write();
         stats.target_fps = self.settings.read().video.config.fps_f64();
@@ -795,38 +812,42 @@ impl StudioBackend for ObsEngine {
 
     fn program_texture_view(&self) -> Option<wgpu::TextureView> {
         self.compositor
-            .lock()
+            .try_lock()?
             .as_ref()
             .map(|c| c.program_egui_view().clone())
     }
 
     fn preview_texture_view(&self) -> Option<wgpu::TextureView> {
         self.compositor
-            .lock()
+            .try_lock()?
             .as_ref()
             .map(|c| c.preview_egui_view().clone())
     }
 
     fn multiview_texture_view(&self) -> Option<wgpu::TextureView> {
         self.compositor
-            .lock()
+            .try_lock()?
             .as_ref()
             .map(|c| c.multiview_egui_view().clone())
     }
 
     fn canvas_size(&self) -> (u32, u32) {
-        self.compositor
-            .lock()
-            .as_ref()
-            .map(|c| c.canvas_size())
-            .unwrap_or_else(|| self.settings.read().video.config.sanitized_canvas_size())
+        self.settings.read().video.config.sanitized_canvas_size()
     }
 
     fn source_dimensions(&self, source_id: SourceId) -> Option<(u32, u32)> {
-        self.compositor
-            .lock()
-            .as_ref()
-            .and_then(|c| c.source_dimensions(source_id))
+        if let Some(comp) = self.compositor.try_lock() {
+            let size = comp.as_ref().and_then(|c| c.source_dimensions(source_id));
+            let mut cache = self.source_sizes.lock();
+            if let Some(size) = size {
+                cache.insert(source_id, size);
+            } else {
+                cache.remove(&source_id);
+            }
+            size
+        } else {
+            self.source_sizes.lock().get(&source_id).copied()
+        }
     }
 
     fn stats(&self) -> EngineStats {
@@ -1217,7 +1238,10 @@ impl StudioBackend for ObsEngine {
         }
         let s = self.settings.read().clone();
         let report = self.encoder_report.read();
-        let encoder_id = resolve_best_video_encoder(&s.output.rec_video_encoder, &report);
+        let report = report
+            .as_ref()
+            .ok_or("Encoder detection is still running. Try again in a moment.")?;
+        let encoder_id = resolve_best_video_encoder(&s.output.rec_video_encoder, report);
         let (ow, oh) = s.video.config.sanitized_output_size();
         let fps = s.video.config.fps_f64().round().clamp(1.0, 240.0) as u32;
         let out_path = expand_recording_filename(
@@ -1308,7 +1332,10 @@ impl StudioBackend for ObsEngine {
             return Err("Stream key is empty. Configure it in Settings -> Stream.".to_string());
         }
         let report = self.encoder_report.read();
-        let encoder_id = resolve_best_video_encoder(&s.output.stream_video_encoder, &report);
+        let report = report
+            .as_ref()
+            .ok_or("Encoder detection is still running. Try again in a moment.")?;
+        let encoder_id = resolve_best_video_encoder(&s.output.stream_video_encoder, report);
         let (ow, oh) = s.video.config.sanitized_output_size();
         let fps = s.video.config.fps_f64().round().clamp(1.0, 240.0) as u32;
 
@@ -1380,7 +1407,10 @@ impl StudioBackend for ObsEngine {
         }
         let s = self.settings.read().clone();
         let report = self.encoder_report.read();
-        let encoder_id = resolve_best_video_encoder(&s.output.rec_video_encoder, &report);
+        let report = report
+            .as_ref()
+            .ok_or("Encoder detection is still running. Try again in a moment.")?;
+        let encoder_id = resolve_best_video_encoder(&s.output.rec_video_encoder, report);
         let (ow, oh) = s.video.config.sanitized_output_size();
         let fps = s.video.config.fps_f64().round().clamp(1.0, 240.0) as u32;
 
@@ -1593,12 +1623,12 @@ impl StudioBackend for ObsEngine {
     }
 
     fn encoder_report(&self) -> EncoderProbeReport {
-        self.encoder_report.read().clone()
+        self.encoder_report.read().clone().unwrap_or_default()
     }
 
     fn reprobe_encoders(&self) -> EncoderProbeReport {
         let rep = probe_all_encoders();
-        *self.encoder_report.write() = rep.clone();
+        *self.encoder_report.write() = Some(rep.clone());
         rep
     }
 
