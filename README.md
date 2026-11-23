@@ -2,7 +2,7 @@
 
 **OxideStudio** is a native Windows 10/11 x64 live streaming and screen recording desktop studio rebuilt from the ground up in **Rust**. Inspired by the architecture and workflow of [OBS Studio](https://github.com/obsproject/obs-studio), OxideStudio combines a `wgpu` GPU compositor, Win32/DXGI/WASAPI/Media Foundation capture backends, real-time pure-Rust audio DSP, multi-track FFmpeg-backed recording, pure-Rust RTMP/RTMPS streaming, a dockable desktop UI, a C-ABI v1 dynamic plugin system, and an OBS WebSocket 5.x server inside a 19-crate Cargo workspace.
 
-> **Honest Scope Statement (`v0.1.2`)**: Every subsystem listed as verified below is backed by real code and automated/live verification on Windows x64. Known differences from upstream C++ OBS Studio (no upstream C/C++ OBS `.dll` binary compatibility shim, no kernel/anti-cheat DLL swapchain hook injection, no native VST2/VST3 host, and headless Edge/Chrome frame capture instead of embedded CEF for Browser Source) are documented clearly in [docs/FEATURE_PARITY.md](docs/FEATURE_PARITY.md).
+> **Honest Scope Statement (`v0.1.3`)**: Every subsystem listed as verified below is backed by real code and automated/live verification on Windows x64. Known differences from upstream C++ OBS Studio (no upstream C/C++ OBS `.dll` binary compatibility shim, no kernel/anti-cheat DLL swapchain hook injection, no native VST2/VST3 host, and headless Edge/Chrome frame capture instead of embedded CEF for Browser Source) are documented clearly in [docs/FEATURE_PARITY.md](docs/FEATURE_PARITY.md).
 
 ## Architecture Overview
 
@@ -31,7 +31,7 @@ OxideStudio is organized into 19 workspace crates plus a reference C-ABI plugin:
 
 Detailed architecture notes are available in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and OBS design notes in [docs/OBS_RESEARCH.md](docs/OBS_RESEARCH.md).
 
-## Key Verified Capabilities (`v0.1.2`)
+## Key Verified Capabilities (`v0.1.3`)
 
 - **Scene Management & Studio Mode**: Unlimited scenes, scene collections with JSON import/export, scene nesting with cycle rejection, grouped items, source reference cloning, Studio Mode Preview/Program with manual T-Bar transitions, and dockable or pop-out Multiview.
 - **GPU Compositing (`wgpu`)**: Hardware-accelerated compositing, crop/pad/rotate/scale transforms, Chroma/Color/Luma Key, Color Correction, Sharpen, Scroll, Image Mask/Blend, Render Delay, custom WGSL shaders, and GPU compute RGBA-to-NV12 conversion.
