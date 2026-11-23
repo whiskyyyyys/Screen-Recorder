@@ -179,11 +179,17 @@ impl Drop for CaptureWorker {
     }
 }
 
+#[derive(Default)]
+struct CaptureWorkers {
+    active: HashMap<SourceId, CaptureWorker>,
+    retiring: HashMap<SourceId, JoinHandle<()>>,
+}
+
 /// Manages active OS capture threads (DXGI Display, Window, Game, Webcam, WASAPI Input/Output/Process).
 pub struct CaptureManager {
     clock: Clock,
     audio_mixer: Arc<AudioMixer>,
-    workers: Mutex<HashMap<SourceId, CaptureWorker>>,
+    workers: Mutex<CaptureWorkers>,
     target_fps: Arc<Mutex<u32>>,
 }
 
@@ -192,7 +198,7 @@ impl CaptureManager {
         Self {
             clock,
             audio_mixer,
-            workers: Mutex::new(HashMap::new()),
+            workers: Mutex::new(CaptureWorkers::default()),
             target_fps: Arc::new(Mutex::new(target_fps.clamp(10, 120))),
         }
     }
@@ -228,24 +234,30 @@ impl CaptureManager {
         }
 
         let mut workers = self.workers.lock();
-        workers.retain(|id, worker| {
-            desired
-                .get(id)
-                .map(|spec| *spec == worker.spec)
-                .unwrap_or(false)
+        let CaptureWorkers { active, retiring } = &mut *workers;
+        retiring.retain(|_, handle| !handle.is_finished());
+        active.retain(|id, worker| {
+            if desired.get(id) == Some(&worker.spec) {
+                return true;
+            }
+            worker.running.store(false, Ordering::Relaxed);
+            if let Some(handle) = worker.handle.take() {
+                retiring.insert(*id, handle);
+            }
+            false
         });
 
         for (id, spec) in desired {
-            workers
+            active
                 .entry(id)
-                .or_insert_with(|| self.spawn_worker(id, spec));
+                .or_insert_with(|| self.spawn_worker(id, spec, retiring.remove(&id)));
         }
     }
 
     pub fn latest_video_frames(&self) -> HashMap<SourceId, VideoFrame> {
         let workers = self.workers.lock();
         let mut out = HashMap::new();
-        for (id, w) in workers.iter() {
+        for (id, w) in &workers.active {
             if let Some(frame) = w.latest_frame.read().as_ref() {
                 out.insert(*id, frame.clone());
             }
@@ -256,7 +268,7 @@ impl CaptureManager {
     pub fn worker_errors(&self) -> HashMap<SourceId, String> {
         let workers = self.workers.lock();
         let mut out = HashMap::new();
-        for (id, w) in workers.iter() {
+        for (id, w) in &workers.active {
             if let Some(err) = w.last_error.lock().as_ref() {
                 out.insert(*id, err.clone());
             }
@@ -265,10 +277,19 @@ impl CaptureManager {
     }
 
     pub fn stop_all(&self) {
-        self.workers.lock().clear();
+        let mut workers = self.workers.lock();
+        workers.active.clear();
+        for (_, handle) in workers.retiring.drain() {
+            let _ = handle.join();
+        }
     }
 
-    fn spawn_worker(&self, source_id: SourceId, spec: CaptureSpec) -> CaptureWorker {
+    fn spawn_worker(
+        &self,
+        source_id: SourceId,
+        spec: CaptureSpec,
+        previous: Option<JoinHandle<()>>,
+    ) -> CaptureWorker {
         let running = Arc::new(AtomicBool::new(true));
         let latest_frame = Arc::new(RwLock::new(None));
         let last_error = Arc::new(Mutex::new(None));
@@ -284,7 +305,16 @@ impl CaptureManager {
         let handle = thread::Builder::new()
             .name(format!("obs-cap-{}", &source_id.to_string()[..8]))
             .spawn(move || {
-                run_worker_loop(source_id, spec_clone, r, lf, le, clock, mixer, fps_arc);
+                // Release the old device before reopening it, off the UI thread.
+                if let Some(handle) = previous {
+                    let _ = handle.join();
+                }
+                if r.load(Ordering::Relaxed) {
+                    run_worker_loop(source_id, spec_clone, r, lf, le, clock, mixer, fps_arc);
+                }
+            })
+            .map_err(|error| {
+                *last_error.lock() = Some(format!("Unable to start capture worker: {error}"));
             })
             .ok();
 

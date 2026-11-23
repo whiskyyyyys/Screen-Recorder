@@ -155,7 +155,7 @@ fn default_scale_height() -> u32 {
     1080
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SourceProperties {
     DisplayCapture {
         monitor_index: usize,

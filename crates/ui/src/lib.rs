@@ -17,7 +17,7 @@ use obs_core::{
     RecordState, ReplayBufferState, SceneId, SceneItemId, SourceId, StreamState, TransitionId,
 };
 use obs_scenes::{SceneCollection, SceneItem, SourceKind};
-use obs_settings::{RecordingFormat, ThemeMode};
+use obs_settings::ThemeMode;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -35,7 +35,7 @@ pub enum DockTab {
 impl DockTab {
     fn title(self) -> &'static str {
         match self {
-            Self::Canvas => "Canvas Preview",
+            Self::Canvas => "Preview",
             Self::Multiview => "Multiview",
             Self::Scenes => "Scenes",
             Self::Sources => "Sources",
@@ -48,15 +48,24 @@ impl DockTab {
 }
 
 fn default_obs_dock_layout() -> DockState<DockTab> {
-    let mut state = DockState::new(vec![DockTab::Canvas, DockTab::Multiview]);
+    let mut state = DockState::new(vec![DockTab::Canvas]);
     let surface = state.main_surface_mut();
-    let [center, bottom] = surface.split_below(NodeIndex::root(), 0.72, vec![DockTab::Scenes]);
-    let [_scenes, sources_node] = surface.split_right(bottom, 0.20, vec![DockTab::Sources]);
-    let [_sources, mixer_node] = surface.split_right(sources_node, 0.25, vec![DockTab::AudioMixer]);
-    let [_mixer, tr_node] = surface.split_right(mixer_node, 0.50, vec![DockTab::Transitions]);
-    let [_tr, _ctrl] = surface.split_right(tr_node, 0.45, vec![DockTab::Controls, DockTab::Stats]);
-    let _ = center;
+    let [_, bottom] = surface.split_below(NodeIndex::root(), 0.64, vec![DockTab::Scenes]);
+    let [_, sources] = surface.split_right(bottom, 0.16, vec![DockTab::Sources]);
+    let [_, mixer] = surface.split_right(sources, 20.0 / 84.0, vec![DockTab::AudioMixer]);
+    let [_, transitions] = surface.split_right(mixer, 27.0 / 64.0, vec![DockTab::Transitions]);
+    surface.split_right(transitions, 17.0 / 37.0, vec![DockTab::Controls]);
     state
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WorkspaceLayout {
+    docks: DockState<DockTab>,
+}
+
+enum RemoveTarget {
+    Scene(SceneId, String),
+    Sources(SceneId, Vec<SceneItemId>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +110,7 @@ pub struct ObsDesktopApp {
     settings_modal: SettingsModalState,
     add_source_modal: AddSourceModalState,
     props_modal_source: Option<SourceId>,
+    display_choices: Option<Vec<obs_platform_windows::MonitorInfo>>,
     filters_modal_source: Option<SourceId>,
     adv_audio_open: bool,
     transition_cfg_modal: Option<TransitionId>,
@@ -110,6 +120,7 @@ pub struct ObsDesktopApp {
 
     inline_prompt: Option<InlinePromptKind>,
     inline_prompt_text: String,
+    remove_target: Option<RemoveTarget>,
     pub(crate) status_toast: ToastQueue,
     last_theme: Option<(ThemeMode, f32)>,
 }
@@ -263,7 +274,8 @@ impl ObsDesktopApp {
         let dock_state = root_state
             .dock_layout_json
             .as_deref()
-            .and_then(|j| serde_json::from_str::<DockState<DockTab>>(j).ok())
+            .and_then(|j| serde_json::from_str::<WorkspaceLayout>(j).ok())
+            .map(|layout| layout.docks)
             .unwrap_or_else(default_obs_dock_layout);
 
         let settings = backend.settings();
@@ -289,6 +301,7 @@ impl ObsDesktopApp {
             settings_modal: SettingsModalState::default(),
             add_source_modal: AddSourceModalState::default(),
             props_modal_source: None,
+            display_choices: None,
             filters_modal_source: None,
             adv_audio_open: false,
             transition_cfg_modal: None,
@@ -297,6 +310,7 @@ impl ObsDesktopApp {
             about_open: false,
             inline_prompt: None,
             inline_prompt_text: String::new(),
+            remove_target: None,
             status_toast: ToastQueue::default(),
             last_theme: Some((mode, settings.accessibility.ui_scale)),
         }
@@ -434,23 +448,40 @@ impl ObsDesktopApp {
                         self.multiview_popout_open = !self.multiview_popout_open;
                         ui.close_menu();
                     }
-                    if ui.button("Reset UI Layout").clicked() {
+                });
+
+                ui.menu_button("Docks", |ui| {
+                    for tab in [
+                        DockTab::Scenes,
+                        DockTab::Sources,
+                        DockTab::AudioMixer,
+                        DockTab::Transitions,
+                        DockTab::Controls,
+                        DockTab::Stats,
+                        DockTab::Multiview,
+                    ] {
+                        let location = self.dock_state.find_tab(&tab);
+                        let mut visible = location.is_some();
+                        if ui.checkbox(&mut visible, tab.title()).changed() {
+                            if let Some(location) = location {
+                                self.dock_state.remove_tab(location);
+                            } else {
+                                self.dock_state.push_to_focused_leaf(tab);
+                                if let Some(location) = self.dock_state.find_tab(&tab) {
+                                    self.dock_state.set_active_tab(location);
+                                }
+                            }
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Reset Docks").clicked() {
                         self.dock_state = default_obs_dock_layout();
                         self.backend.update_dock_layout(None);
                         ui.close_menu();
                     }
                     if ui.button("Save Current UI Layout").clicked() {
-                        if let Ok(j) = serde_json::to_string(&self.dock_state) {
-                            self.backend.update_dock_layout(Some(j));
-                            self.status_toast.push_info("Workspace dock layout saved.");
-                        }
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Stats").clicked() {
-                        if self.dock_state.find_tab(&DockTab::Stats).is_none() {
-                            self.dock_state.push_to_first_leaf(DockTab::Stats);
-                        }
+                        self.save_dock_layout();
+                        self.status_toast.push_info("Workspace dock layout saved.");
                         ui.close_menu();
                     }
                 });
@@ -639,6 +670,72 @@ impl ObsDesktopApp {
         });
     }
 
+    fn save_dock_layout(&self) {
+        if let Ok(json) = serde_json::to_string(&WorkspaceLayout {
+            docks: self.dock_state.clone(),
+        }) {
+            self.backend.update_dock_layout(Some(json));
+        }
+    }
+
+    fn remove_sources(&mut self, scene: SceneId, items: Vec<SceneItemId>) {
+        if !items.is_empty() {
+            self.remove_target = Some(RemoveTarget::Sources(scene, items));
+        }
+    }
+
+    fn render_remove_dialog(&mut self, ctx: &egui::Context) {
+        let Some(target) = &self.remove_target else {
+            return;
+        };
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let response = egui::Modal::new(egui::Id::new("confirm_remove")).show(ctx, |ui| {
+            ui.heading("Confirm Remove");
+            match target {
+                RemoveTarget::Scene(_, name) => ui.label(format!("Remove scene \"{name}\"?")),
+                RemoveTarget::Sources(_, items) if items.len() == 1 => {
+                    ui.label("Remove this source from the scene?")
+                }
+                RemoveTarget::Sources(_, items) => {
+                    ui.label(format!("Remove {} sources from the scene?", items.len()))
+                }
+            };
+            ui.horizontal(|ui| {
+                confirmed = ui.button("Remove").clicked();
+                cancelled = ui.button("Cancel").clicked();
+            });
+        });
+        if cancelled || response.should_close() {
+            self.remove_target = None;
+        } else if confirmed {
+            match self.remove_target.take().unwrap() {
+                RemoveTarget::Scene(id, _) => {
+                    if let Err(error) = self.backend.delete_scene(id) {
+                        self.status_toast.push_error(error);
+                    } else {
+                        self.selected_items.clear();
+                    }
+                }
+                RemoveTarget::Sources(scene, items) => {
+                    let mut remaining = items;
+                    while let Some(id) = remaining.pop() {
+                        // Removing a group may already have removed selected children.
+                        if self.backend.collection().find_item(scene, id).is_some() {
+                            if let Err(error) = self.backend.remove_scene_item(scene, id) {
+                                self.status_toast.push_error(error);
+                            } else {
+                                self.selected_items.retain(|&item| item != id);
+                            }
+                        } else {
+                            self.selected_items.retain(|&item| item != id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn transform_selected(&mut self, op: TransformOp) {
         let Some(&item_id) = self.selected_items.first() else {
             return;
@@ -646,7 +743,12 @@ impl ObsDesktopApp {
         let (cw, ch) = self.backend.canvas_size();
         let canvas = [cw as f32, ch as f32];
         let col = self.backend.collection();
-        let Some(item) = col.find_item(col.active_scene_id, item_id) else {
+        let scene = if self.backend.studio_mode() {
+            col.preview_scene_id.unwrap_or(col.active_scene_id)
+        } else {
+            col.active_scene_id
+        };
+        let Some(item) = col.find_item(scene, item_id) else {
             return;
         };
         let src_size = self
@@ -656,8 +758,7 @@ impl ObsDesktopApp {
             .unwrap_or(canvas);
 
         self.backend.with_collection_mut(&mut |c| {
-            let sid = c.active_scene_id;
-            if let Some(it) = c.find_item_mut(sid, item_id) {
+            if let Some(it) = c.find_item_mut(scene, item_id) {
                 match op {
                     TransformOp::Fit => {
                         SceneCollection::fit_item_to_canvas(&mut it.transform, src_size, canvas)
@@ -832,8 +933,14 @@ impl eframe::App for ObsDesktopApp {
             backend_ref,
             &mut self.status_toast,
             &mut self.props_modal_source,
+            &mut self.selected_items,
         );
-        render_source_properties_modal(ctx, &mut self.props_modal_source, backend_ref);
+        render_source_properties_modal(
+            ctx,
+            &mut self.props_modal_source,
+            backend_ref,
+            &mut self.display_choices,
+        );
         render_filters_modal(ctx, &mut self.filters_modal_source, backend_ref);
         render_advanced_audio_modal(ctx, &mut self.adv_audio_open, backend_ref);
         render_transition_config_modal(ctx, &mut self.transition_cfg_modal, backend_ref);
@@ -846,14 +953,13 @@ impl eframe::App for ObsDesktopApp {
         );
         render_about_modal(ctx, &mut self.about_open, backend_ref);
         self.render_inline_prompt(ctx);
+        self.render_remove_dialog(ctx);
 
         ctx.request_repaint();
     }
 
     fn on_exit(&mut self) {
-        if let Ok(j) = serde_json::to_string(&self.dock_state) {
-            self.backend.update_dock_layout(Some(j));
-        }
+        self.save_dock_layout();
         self.backend.shutdown();
     }
 }
@@ -864,6 +970,10 @@ struct ObsTabViewer<'a> {
 
 impl<'a> TabViewer for ObsTabViewer<'a> {
     type Tab = DockTab;
+
+    fn closeable(&mut self, tab: &mut Self::Tab) -> bool {
+        *tab != DockTab::Canvas
+    }
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         tab.title().into()
@@ -877,7 +987,9 @@ impl<'a> TabViewer for ObsTabViewer<'a> {
             DockTab::Sources => self.ui_sources(ui),
             DockTab::AudioMixer => self.ui_audio_mixer(ui),
             DockTab::Transitions => self.ui_transitions(ui),
-            DockTab::Controls => self.ui_controls(ui),
+            DockTab::Controls => {
+                egui::ScrollArea::vertical().show(ui, |ui| self.ui_controls(ui));
+            }
             DockTab::Stats => self.ui_stats(ui),
         }
     }
@@ -1006,6 +1118,15 @@ impl<'a> ObsTabViewer<'a> {
             ui.id().with(("canvas_hit", tex_id)),
             Sense::click_and_drag(),
         );
+        if (resp.clicked() || resp.drag_started()) && self.app.remove_target.is_none() {
+            resp.request_focus();
+        }
+        if resp.has_focus()
+            && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+        {
+            self.app
+                .remove_sources(target_scene_id, self.app.selected_items.clone());
+        }
         let alt_held = ui.input(|i| i.modifiers.alt);
         let settings = self.app.backend.settings();
         let sel_c = settings.accessibility.selection_color_rgba;
@@ -1326,7 +1447,8 @@ impl<'a> ObsTabViewer<'a> {
         };
 
         egui::ScrollArea::vertical()
-            .max_height(ui.available_height() - 32.0)
+            .auto_shrink([false, false])
+            .max_height((ui.available_height() - 32.0).max(0.0))
             .show(ui, |ui| {
                 for (idx, sc) in col.scenes.iter().enumerate() {
                     let is_sel = sc.id == selected_id;
@@ -1338,12 +1460,20 @@ impl<'a> ObsTabViewer<'a> {
                     };
                     let resp = ui.selectable_label(is_sel, label);
                     if resp.clicked() {
+                        resp.request_focus();
                         if studio {
                             self.app.backend.set_preview_scene(sc.id);
                         } else {
                             self.app.backend.switch_scene(sc.id);
                         }
                         self.app.selected_items.clear();
+                    }
+                    if is_sel
+                        && col.scenes.len() > 1
+                        && resp.has_focus()
+                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+                    {
+                        self.app.remove_target = Some(RemoveTarget::Scene(sc.id, sc.name.clone()));
                     }
                     resp.context_menu(|ui| {
                         if ui.button("Rename").clicked() {
@@ -1364,7 +1494,8 @@ impl<'a> ObsTabViewer<'a> {
                             ui.close_menu();
                         }
                         if col.scenes.len() > 1 && ui.button("Remove").clicked() {
-                            let _ = self.app.backend.delete_scene(sc.id);
+                            self.app.remove_target =
+                                Some(RemoveTarget::Scene(sc.id, sc.name.clone()));
                             ui.close_menu();
                         }
                     });
@@ -1377,13 +1508,15 @@ impl<'a> ObsTabViewer<'a> {
                 self.app.inline_prompt = Some(InlinePromptKind::CreateScene);
                 self.app.inline_prompt_text = format!("Scene {}", col.scenes.len() + 1);
             }
-            if ui.button("-").on_hover_text("Remove Scene").clicked() {
-                if let Err(e) = self.app.backend.delete_scene(selected_id) {
-                    self.app.status_toast.push_error(e);
+            if ui
+                .add_enabled(col.scenes.len() > 1, egui::Button::new("−"))
+                .on_hover_text("Remove Scene (Delete)")
+                .clicked()
+            {
+                if let Some(scene) = col.scene_by_id(selected_id) {
+                    self.app.remove_target =
+                        Some(RemoveTarget::Scene(selected_id, scene.name.clone()));
                 }
-            }
-            if ui.button("Dup").on_hover_text("Duplicate Scene").clicked() {
-                let _ = self.app.backend.duplicate_scene(selected_id);
             }
             if let Some(idx) = col.scenes.iter().position(|s| s.id == selected_id) {
                 if idx > 0 && ui.button("Up").on_hover_text("Move Scene Up").clicked() {
@@ -1415,7 +1548,8 @@ impl<'a> ObsTabViewer<'a> {
         let ctrl_held = ui.input(|i| i.modifiers.ctrl);
 
         egui::ScrollArea::vertical()
-            .max_height(ui.available_height() - 32.0)
+            .auto_shrink([false, false])
+            .max_height((ui.available_height() - 32.0).max(0.0))
             .show(ui, |ui| {
                 if let Some(scene) = col.scene_by_id(target_scene_id) {
                     // Draw topmost layer first (OBS convention: reverse of render order)
@@ -1423,6 +1557,7 @@ impl<'a> ObsTabViewer<'a> {
                         self.draw_source_row(
                             ui,
                             &col,
+                            target_scene_id,
                             item,
                             0,
                             &errors,
@@ -1477,41 +1612,13 @@ impl<'a> ObsTabViewer<'a> {
                     }
                 }
             });
-            if ui.button("-").on_hover_text("Remove Source").clicked() {
-                for id in self.app.selected_items.drain(..) {
-                    let _ = self.app.backend.remove_scene_item(target_scene_id, id);
-                }
-            }
             if ui
-                .button("Props")
-                .on_hover_text("Source Properties")
+                .add_enabled(!self.app.selected_items.is_empty(), egui::Button::new("−"))
+                .on_hover_text("Remove Source (Delete)")
                 .clicked()
             {
-                if let Some(&id) = self.app.selected_items.first() {
-                    if let Some(it) = col.find_item(target_scene_id, id) {
-                        self.app.props_modal_source = Some(it.source_id);
-                    }
-                }
-            }
-            if ui
-                .button("Filters")
-                .on_hover_text("Source Filters")
-                .clicked()
-            {
-                if let Some(&id) = self.app.selected_items.first() {
-                    if let Some(it) = col.find_item(target_scene_id, id) {
-                        self.app.filters_modal_source = Some(it.source_id);
-                    }
-                }
-            }
-            if !self.app.selected_items.is_empty()
-                && ui.button("Grp").on_hover_text("Group Selected").clicked()
-            {
-                let _ = self.app.backend.group_items(
-                    target_scene_id,
-                    &self.app.selected_items,
-                    "Group",
-                );
+                self.app
+                    .remove_sources(target_scene_id, self.app.selected_items.clone());
             }
             if ui.button("Up").on_hover_text("Move Layer Up").clicked() {
                 if let Some(&id) = self.app.selected_items.first() {
@@ -1535,6 +1642,7 @@ impl<'a> ObsTabViewer<'a> {
         &mut self,
         ui: &mut Ui,
         col: &SceneCollection,
+        scene_id: SceneId,
         item: &SceneItem,
         depth: usize,
         errors: &std::collections::HashMap<SourceId, String>,
@@ -1560,6 +1668,7 @@ impl<'a> ObsTabViewer<'a> {
             let prefix = if item.is_group() { "[G] " } else { "" };
             let resp = ui.selectable_label(is_sel, format!("{prefix}{name}"));
             if resp.clicked() {
+                resp.request_focus();
                 if ctrl_held {
                     if is_sel {
                         self.app.selected_items.retain(|&x| x != item.id);
@@ -1573,13 +1682,39 @@ impl<'a> ObsTabViewer<'a> {
             if resp.double_clicked() {
                 *open_props = Some(item.source_id);
             }
+            if resp.has_focus()
+                && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete))
+            {
+                self.app
+                    .remove_sources(scene_id, self.app.selected_items.clone());
+            }
             resp.context_menu(|ui| {
+                if ui.button("Remove").clicked() {
+                    let items = if is_sel {
+                        self.app.selected_items.clone()
+                    } else {
+                        vec![item.id]
+                    };
+                    self.app.remove_sources(scene_id, items);
+                    ui.close_menu();
+                }
                 if ui.button("Properties").clicked() {
                     *open_props = Some(item.source_id);
                     ui.close_menu();
                 }
                 if ui.button("Filters").clicked() {
                     *open_filters = Some(item.source_id);
+                    ui.close_menu();
+                }
+                if is_sel && !item.is_group() && ui.button("Group Selected Items").clicked() {
+                    match self
+                        .app
+                        .backend
+                        .group_items(scene_id, &self.app.selected_items, "Group")
+                    {
+                        Ok(id) => self.app.selected_items = vec![id],
+                        Err(error) => self.app.status_toast.push_error(error),
+                    }
                     ui.close_menu();
                 }
                 if item.is_group() && ui.button("Ungroup").clicked() {
@@ -1617,6 +1752,7 @@ impl<'a> ObsTabViewer<'a> {
                 self.draw_source_row(
                     ui,
                     col,
+                    scene_id,
                     child,
                     depth + 1,
                     errors,
@@ -1792,7 +1928,7 @@ impl<'a> ObsTabViewer<'a> {
         let paused = stats.recording.state == RecordState::Paused;
         let replay_active = stats.replay.state != ReplayBufferState::Stopped;
 
-        let btn_w = ui.available_width().max(120.0);
+        let btn_w = ui.available_width();
 
         let stream_btn = egui::Button::new(if streaming {
             "Stop Streaming"
@@ -1818,7 +1954,7 @@ impl<'a> ObsTabViewer<'a> {
 
         ui.horizontal(|ui| {
             let rec_w = if recording {
-                (btn_w - 48.0).max(80.0)
+                (btn_w - 42.0 - ui.spacing().item_spacing.x).max(0.0)
             } else {
                 btn_w
             };
@@ -1867,7 +2003,7 @@ impl<'a> ObsTabViewer<'a> {
 
         ui.horizontal(|ui| {
             let rw = if replay_active {
-                (btn_w - 42.0).max(80.0)
+                (btn_w - 36.0 - ui.spacing().item_spacing.x).max(0.0)
             } else {
                 btn_w
             };
@@ -1918,37 +2054,6 @@ impl<'a> ObsTabViewer<'a> {
             });
         if ui.add(st_btn).clicked() {
             self.app.backend.set_studio_mode(!studio);
-        }
-
-        // Quick recording format selector right in Controls dock
-        {
-            let mut cur_settings = self.app.backend.settings();
-            let mut sel_fmt = cur_settings.output.rec_format;
-            ui.horizontal(|ui| {
-                ui.label("Format:");
-                ui.add_enabled_ui(!recording, |ui| {
-                    egui::ComboBox::from_id_salt("ctrl_rec_fmt")
-                        .width((btn_w - 58.0).max(80.0))
-                        .selected_text(format!(".{}", sel_fmt.extension().to_uppercase()))
-                        .show_ui(ui, |ui| {
-                            for f in [
-                                RecordingFormat::Mkv,
-                                RecordingFormat::Mp4,
-                                RecordingFormat::FragmentedMp4,
-                                RecordingFormat::Mov,
-                                RecordingFormat::Flv,
-                            ] {
-                                ui.selectable_value(&mut sel_fmt, f, f.display_name());
-                            }
-                        });
-                });
-            });
-            if sel_fmt != cur_settings.output.rec_format {
-                cur_settings.output.rec_format = sel_fmt;
-                if let Err(e) = self.app.backend.apply_settings(cur_settings) {
-                    self.app.status_toast.push_error(e);
-                }
-            }
         }
 
         if ui

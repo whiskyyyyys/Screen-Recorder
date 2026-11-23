@@ -1062,6 +1062,7 @@ pub fn render_add_source_modal(
     backend: &dyn StudioBackend,
     toast: &mut crate::ToastQueue,
     props_modal: &mut Option<SourceId>,
+    selection: &mut Vec<obs_core::SceneItemId>,
 ) {
     if !st.open {
         return;
@@ -1100,7 +1101,11 @@ pub fn render_add_source_modal(
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("OK").clicked() {
-                    let active_scene = col.active_scene_id;
+                    let active_scene = if backend.studio_mode() {
+                        col.preview_scene_id.unwrap_or(col.active_scene_id)
+                    } else {
+                        col.active_scene_id
+                    };
                     if st.create_new {
                         let mut props = SourceProperties::default_for(kind);
                         if let SourceProperties::SceneSource { scene_id } = &mut props {
@@ -1109,15 +1114,19 @@ pub fn render_add_source_modal(
                             }
                         }
                         match backend.add_new_source(active_scene, &st.new_name, kind, props) {
-                            Ok((sid, _)) => {
+                            Ok((sid, item)) => {
                                 st.open = false;
                                 *props_modal = Some(sid);
+                                *selection = vec![item];
                             }
                             Err(e) => toast.push_error(e),
                         }
                     } else if let Some(existing_id) = st.selected_existing {
                         match backend.add_existing_source(active_scene, existing_id) {
-                            Ok(_) => st.open = false,
+                            Ok(item) => {
+                                st.open = false;
+                                *selection = vec![item];
+                            }
                             Err(e) => toast.push_error(e),
                         }
                     }
@@ -1136,8 +1145,10 @@ pub fn render_source_properties_modal(
     ctx: &egui::Context,
     source_id_opt: &mut Option<SourceId>,
     backend: &dyn StudioBackend,
+    display_choices: &mut Option<Vec<obs_platform_windows::MonitorInfo>>,
 ) {
     let Some(source_id) = *source_id_opt else {
+        *display_choices = None;
         return;
     };
     let col = backend.collection();
@@ -1171,7 +1182,7 @@ pub fn render_source_properties_modal(
                     if *force_gdi && capture_method == "Auto" {
                         *capture_method = "GDI".to_string();
                     }
-                    let mons = backend.enumerate_monitors();
+                    let mons = display_choices.get_or_insert_with(|| backend.enumerate_monitors());
                     let cur_lbl = mons
                         .get(*monitor_index)
                         .map(|m| m.display_label())
@@ -1180,12 +1191,12 @@ pub fn render_source_properties_modal(
                         egui::ComboBox::from_label("Display")
                             .selected_text(cur_lbl)
                             .show_ui(ui, |ui| {
-                                for m in &mons {
+                                for m in &*mons {
                                     ui.selectable_value(monitor_index, m.index, m.display_label());
                                 }
                             });
                         if ui.button("Refresh").clicked() {
-                            ctx.request_repaint();
+                            *mons = backend.enumerate_monitors();
                         }
                     });
                     egui::ComboBox::from_label("Capture Method")
@@ -1773,12 +1784,18 @@ pub fn render_source_properties_modal(
             }
         });
 
-    backend.with_collection_mut(&mut |c| {
-        if let Some(s) = c.sources.get_mut(&source_id) {
-            s.name = name.clone();
-            s.properties = props.clone();
-        }
-    });
+    if name != src_def.name || props != src_def.properties {
+        backend.with_collection_mut(&mut |c| {
+            if let Some(s) = c.sources.get_mut(&source_id) {
+                if name != src_def.name {
+                    s.name.clone_from(&name);
+                }
+                if props != src_def.properties {
+                    s.properties.clone_from(&props);
+                }
+            }
+        });
+    }
 
     if !open {
         *source_id_opt = None;
