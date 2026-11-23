@@ -1,0 +1,79 @@
+name: CI & Windows Release
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Download portable FFmpeg GPL build for testing & bundling
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path ".tools\ffmpeg" | Out-Null
+          curl.exe -L -s -S --fail "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -o "$env:TEMP\ffmpeg.zip"
+          7z x "$env:TEMP\ffmpeg.zip" "-o$env:TEMP\ffmpeg-ext" -y | Out-Null
+          $sub = Get-ChildItem "$env:TEMP\ffmpeg-ext" | Select-Object -First 1
+          Copy-Item "$($sub.FullName)\bin\ffmpeg.exe" ".tools\ffmpeg\ffmpeg.exe" -Force
+          Copy-Item "$($sub.FullName)\bin\ffprobe.exe" ".tools\ffmpeg\ffprobe.exe" -Force
+          if (Test-Path "$($sub.FullName)\LICENSE.txt") { Copy-Item "$($sub.FullName)\LICENSE.txt" ".tools\ffmpeg\LICENSE" -Force }
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build workspace
+        run: cargo build --workspace --release
+
+      - name: Run automated test suite
+        run: cargo test --workspace -- --test-threads=1
+
+      - name: Run headless end-to-end self-test
+        run: .\target\release\obs-rust.exe --self-test
+
+      - name: Package Portable ZIP and Windows Setup Installer
+        shell: pwsh
+        run: |
+          .\packaging\windows\package.ps1 -SkipBuild
+          Get-FileHash dist\OBS-Rust-Portable-x64.zip, dist\OBS-Rust-Setup-x64.exe -Algorithm SHA256 | Format-Table -AutoSize
+          (Get-FileHash dist\OBS-Rust-Portable-x64.zip -Algorithm SHA256).Hash + "  OBS-Rust-Portable-x64.zip" | Out-File dist\SHA256SUMS.txt -Encoding ascii
+          (Get-FileHash dist\OBS-Rust-Setup-x64.exe -Algorithm SHA256).Hash + "  OBS-Rust-Setup-x64.exe" | Out-File dist\SHA256SUMS.txt -Append -Encoding ascii
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OxideStudio-Windows-x64
+          path: |
+            dist/OBS-Rust-Portable-x64.zip
+            dist/OBS-Rust-Setup-x64.exe
+            dist/SHA256SUMS.txt
+
+      - name: Publish GitHub Release on version tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/OBS-Rust-Portable-x64.zip
+            dist/OBS-Rust-Setup-x64.exe
+            dist/SHA256SUMS.txt

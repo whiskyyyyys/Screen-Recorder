@@ -1,0 +1,19 @@
+[package]
+name = "obs-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+obs-core.workspace = true
+obs-video.workspace = true
+obs-filters.workspace = true
+obs-transitions.workspace = true
+obs-scenes.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
+image.workspace = true
+parking_lot.workspace = true
+pollster.workspace = true
+serde_json.workspace = true

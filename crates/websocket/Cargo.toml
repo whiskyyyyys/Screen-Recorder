@@ -1,0 +1,17 @@
+[package]
+name = "obs-websocket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+obs-core.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+base64.workspace = true
+rand.workspace = true
+parking_lot.workspace = true

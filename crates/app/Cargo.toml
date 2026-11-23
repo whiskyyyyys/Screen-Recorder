@@ -1,0 +1,54 @@
+[package]
+name = "obs-rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "obs-rust"
+path = "src/main.rs"
+
+[dependencies]
+obs-core.workspace = true
+obs-video.workspace = true
+obs-settings.workspace = true
+obs-filters.workspace = true
+obs-transitions.workspace = true
+obs-scenes.workspace = true
+obs-audio.workspace = true
+obs-platform-windows = { path = "../platform-windows" }
+obs-sources = { path = "../sources" }
+obs-renderer = { path = "../renderer" }
+obs-encoder = { path = "../encoder" }
+obs-recorder = { path = "../recorder" }
+obs-streamer = { path = "../streamer" }
+obs-plugins = { path = "../plugins" }
+obs-websocket = { path = "../websocket" }
+obs-ui = { path = "../ui" }
+eframe.workspace = true
+egui.workspace = true
+wgpu.workspace = true
+tokio.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+image.workspace = true
+chrono.workspace = true
+
+[dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+]
+
+[dev-dependencies]
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+rml_rtmp.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+base64.workspace = true

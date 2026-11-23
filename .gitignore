@@ -1,0 +1,29 @@
+# Build outputs
+/target/
+**/target/
+**/*.rs.bk
+Cargo.lock
+
+# Local downloaded tools & installer output
+/.tools/
+/dist/
+
+# Scratch / test media files
+*.mkv
+*.mp4
+*.mov
+*.flv
+*.ts
+*.wav
+*.pcm
+
+# User config / portable runtime files
+/config/
+portable_mode.txt
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+*.log
+.vscode/
+.idea/

@@ -1,0 +1,14 @@
+[package]
+name = "obs-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+obs-core.workspace = true
+obs-video.workspace = true
+obs-scenes.workspace = true
+obs-audio.workspace = true
+obs-platform-windows = { path = "../platform-windows" }
+parking_lot.workspace = true
+serde.workspace = true

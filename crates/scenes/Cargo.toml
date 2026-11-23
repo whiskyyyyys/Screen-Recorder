@@ -1,0 +1,12 @@
+[package]
+name = "obs-scenes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+obs-core.workspace = true
+obs-filters.workspace = true
+obs-transitions.workspace = true

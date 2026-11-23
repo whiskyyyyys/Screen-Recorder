@@ -1,0 +1,12 @@
+[package]
+name = "obs-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+parking_lot.workspace = true
+obs-core.workspace = true
+obs-filters.workspace = true
+obs-scenes.workspace = true

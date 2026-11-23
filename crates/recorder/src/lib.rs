@@ -1,0 +1,413 @@
+pub mod named_pipe;
+pub mod remux;
+pub mod replay;
+
+pub use remux::remux_to_mp4;
+pub use replay::{ReplayBufferConfig, ReplayBufferSession};
+
+use crossbeam_channel::{bounded, Sender};
+use named_pipe::WindowsNamedPipe;
+use obs_core::{ObsError, RecordState, RecordingStats, Result};
+use obs_encoder::{build_video_encoder_args, locate_ffmpeg, VideoEncodeParams};
+use obs_settings::RecordingFormat;
+use obs_video::{ColorRange, ColorSpace};
+use parking_lot::Mutex;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+pub struct RecordingConfig {
+    pub output_path: PathBuf,
+    pub format: RecordingFormat,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub sample_rate: u32,
+    pub video_encoder: String,
+    pub audio_encoder: String,
+    pub rate_control: String,
+    pub bitrate_kbps: u32,
+    pub crf: u8,
+    pub preset: String,
+    pub keyint_sec: u32,
+    pub audio_track_mask: u8,
+    pub audio_bitrate_kbps: u32,
+    pub color_space: ColorSpace,
+    pub color_range: ColorRange,
+    pub auto_remux_to_mp4: bool,
+}
+
+pub fn expand_recording_filename(dir: &str, pattern: &str, format: RecordingFormat) -> PathBuf {
+    let now = chrono::Local::now();
+    let mut name = pattern.to_string();
+    let replacements = [
+        ("%CCYY", "%Y"),
+        ("%YY", "%y"),
+        ("%MM", "%m"),
+        ("%DD", "%d"),
+        ("%hh", "%H"),
+        ("%mm", "%M"),
+        ("%ss", "%S"),
+    ];
+    for (obs_tok, chrono_tok) in replacements {
+        name = name.replace(obs_tok, chrono_tok);
+    }
+    let formatted = now.format(&name).to_string();
+    let safe_name = if formatted.trim().is_empty() {
+        now.format("%Y-%m-%d %H-%M-%S").to_string()
+    } else {
+        formatted
+    };
+    PathBuf::from(dir).join(format!("{safe_name}.{}", format.extension()))
+}
+
+pub struct RecordingSession {
+    config: RecordingConfig,
+    active_track_indices: Vec<usize>,
+    video_tx: Option<Sender<Vec<u8>>>,
+    audio_txs: Vec<(usize, Sender<Vec<u8>>)>,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    state: Arc<Mutex<RecordState>>,
+    start_instant: Instant,
+    paused_accum: Mutex<Duration>,
+    pause_started: Mutex<Option<Instant>>,
+    encoded_frames: Arc<AtomicU64>,
+    skipped_frames: Arc<AtomicU64>,
+    child: Mutex<Option<Child>>,
+    threads: Vec<JoinHandle<()>>,
+    stderr_log: Arc<Mutex<String>>,
+}
+
+impl RecordingSession {
+    pub fn start(config: RecordingConfig) -> Result<Self> {
+        let ffmpeg = locate_ffmpeg()?;
+        if let Some(parent) = config.output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut active_track_indices = Vec::new();
+        for bit in 0..6usize {
+            if (config.audio_track_mask & (1 << bit)) != 0 {
+                active_track_indices.push(bit);
+            }
+        }
+        if active_track_indices.is_empty() {
+            active_track_indices.push(0);
+        }
+
+        let mut pipes = Vec::with_capacity(active_track_indices.len());
+        let session_uuid = Uuid::new_v4();
+        for &track_idx in &active_track_indices {
+            let pipe =
+                WindowsNamedPipe::create(&format!("obs-rust-rec-{session_uuid}-t{track_idx}"))?;
+            pipes.push((track_idx, pipe));
+        }
+
+        let mut cmd = Command::new(&ffmpeg);
+        #[cfg(windows)]
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.args([
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "nv12",
+            "-s",
+            &format!("{}x{}", config.width, config.height),
+            "-r",
+            &config.fps.max(1).to_string(),
+            "-i",
+            "pipe:0",
+        ]);
+
+        for (_, pipe) in &pipes {
+            cmd.args([
+                "-f",
+                "f32le",
+                "-ar",
+                &config.sample_rate.to_string(),
+                "-ac",
+                "2",
+                "-i",
+                &pipe.path,
+            ]);
+        }
+
+        cmd.args(["-map", "0:v:0"]);
+        for i in 0..pipes.len() {
+            cmd.args(["-map", &format!("{}:a:0", i + 1)]);
+        }
+
+        let v_args = build_video_encoder_args(&VideoEncodeParams {
+            encoder_id: config.video_encoder.clone(),
+            bitrate_kbps: config.bitrate_kbps,
+            rate_control: config.rate_control.clone(),
+            crf: config.crf,
+            preset: config.preset.clone(),
+            keyint_sec: config.keyint_sec,
+            fps: config.fps,
+            color_space: config.color_space,
+            color_range: config.color_range,
+            streaming_low_latency: false,
+        });
+        cmd.args(v_args);
+
+        let acodec = if config.audio_encoder == "libopus" {
+            "libopus"
+        } else {
+            "aac"
+        };
+        cmd.args([
+            "-c:a",
+            acodec,
+            "-b:a",
+            &format!("{}k", config.audio_bitrate_kbps.clamp(64, 512)),
+        ]);
+
+        if config.format == RecordingFormat::FragmentedMp4 {
+            cmd.args(["-movflags", "frag_keyframe+empty_moov+default_base_moof"]);
+        } else if config.format == RecordingFormat::Mp4 || config.format == RecordingFormat::Mov {
+            cmd.args(["-movflags", "+faststart"]);
+        }
+
+        cmd.args([
+            "-f",
+            config.format.ffmpeg_format(),
+            &config.output_path.to_string_lossy(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| ObsError::Recorder(format!("Failed spawning recorder FFmpeg: {e}")))?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| ObsError::Recorder("Missing recorder stdin".into()))?;
+        let stderr = child.stderr.take();
+
+        let running = Arc::new(AtomicBool::new(true));
+        let paused = Arc::new(AtomicBool::new(false));
+        let encoded_frames = Arc::new(AtomicU64::new(0));
+        let skipped_frames = Arc::new(AtomicU64::new(0));
+        let stderr_log = Arc::new(Mutex::new(String::new()));
+        let mut threads = Vec::new();
+
+        if let Some(mut err_pipe) = stderr {
+            let log_arc = Arc::clone(&stderr_log);
+            threads.push(
+                thread::Builder::new()
+                    .name("obs-rec-stderr".into())
+                    .spawn(move || {
+                        use std::io::Read;
+                        let mut s = String::new();
+                        let _ = err_pipe.read_to_string(&mut s);
+                        if !s.trim().is_empty() {
+                            *log_arc.lock() = s;
+                        }
+                    })
+                    .map_err(ObsError::Io)?,
+            );
+        }
+
+        let (video_tx, video_rx) = bounded::<Vec<u8>>(12);
+        let r_vid = Arc::clone(&running);
+        let enc_frames = Arc::clone(&encoded_frames);
+        threads.push(
+            thread::Builder::new()
+                .name("obs-rec-vid".into())
+                .spawn(move || {
+                    while let Ok(frame) = video_rx.recv() {
+                        if stdin.write_all(&frame).is_err() {
+                            break;
+                        }
+                        enc_frames.fetch_add(1, Ordering::Relaxed);
+                        if !r_vid.load(Ordering::Relaxed) && video_rx.is_empty() {
+                            break;
+                        }
+                    }
+                    let _ = stdin.flush();
+                    drop(stdin);
+                })
+                .map_err(ObsError::Io)?,
+        );
+
+        let mut audio_txs = Vec::with_capacity(pipes.len());
+        for (track_idx, mut pipe) in pipes {
+            let (tx, rx) = bounded::<Vec<u8>>(128);
+            let r_aud = Arc::clone(&running);
+            threads.push(
+                thread::Builder::new()
+                    .name(format!("obs-rec-aud-{track_idx}"))
+                    .spawn(move || {
+                        if pipe.connect().is_err() {
+                            return;
+                        }
+                        while let Ok(bytes) = rx.recv() {
+                            if pipe.write_all(&bytes).is_err() {
+                                break;
+                            }
+                            if !r_aud.load(Ordering::Relaxed) && rx.is_empty() {
+                                break;
+                            }
+                        }
+                        pipe.close();
+                    })
+                    .map_err(ObsError::Io)?,
+            );
+            audio_txs.push((track_idx, tx));
+        }
+
+        Ok(Self {
+            config,
+            active_track_indices,
+            video_tx: Some(video_tx),
+            audio_txs,
+            running,
+            paused,
+            state: Arc::new(Mutex::new(RecordState::Recording)),
+            start_instant: Instant::now(),
+            paused_accum: Mutex::new(Duration::ZERO),
+            pause_started: Mutex::new(None),
+            encoded_frames,
+            skipped_frames,
+            child: Mutex::new(Some(child)),
+            threads,
+            stderr_log,
+        })
+    }
+
+    pub fn push_video_nv12(&self, nv12: &[u8]) {
+        if self.paused.load(Ordering::Relaxed) || !self.running.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(tx) = &self.video_tx {
+            if tx.try_send(nv12.to_vec()).is_err() {
+                self.skipped_frames.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn push_audio_tracks(&self, tracks: &[Vec<f32>; 6]) {
+        if self.paused.load(Ordering::Relaxed) || !self.running.load(Ordering::Relaxed) {
+            return;
+        }
+        for (track_idx, tx) in &self.audio_txs {
+            if let Some(samples) = tracks.get(*track_idx) {
+                let mut bytes = Vec::with_capacity(samples.len() * 4);
+                for &s in samples {
+                    bytes.extend_from_slice(&s.to_le_bytes());
+                }
+                let _ = tx.try_send(bytes);
+            }
+        }
+    }
+
+    pub fn pause(&self) {
+        if !self.paused.swap(true, Ordering::SeqCst) {
+            *self.pause_started.lock() = Some(Instant::now());
+            *self.state.lock() = RecordState::Paused;
+        }
+    }
+
+    pub fn resume(&self) {
+        if self.paused.swap(false, Ordering::SeqCst) {
+            if let Some(t) = self.pause_started.lock().take() {
+                *self.paused_accum.lock() += t.elapsed();
+            }
+            *self.state.lock() = RecordState::Recording;
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    pub fn active_tracks(&self) -> &[usize] {
+        &self.active_track_indices
+    }
+
+    pub fn stats(&self) -> RecordingStats {
+        let mut paused_dur = *self.paused_accum.lock();
+        if let Some(p) = *self.pause_started.lock() {
+            paused_dur += p.elapsed();
+        }
+        let active_dur = self.start_instant.elapsed().saturating_sub(paused_dur);
+        let bytes_written = fs::metadata(&self.config.output_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let secs = active_dur.as_secs_f64().max(0.001);
+        let bitrate_kbps = ((bytes_written as f64) * 8.0 / 1000.0) / secs;
+
+        RecordingStats {
+            state: *self.state.lock(),
+            output_path: self.config.output_path.to_string_lossy().to_string(),
+            duration_ms: active_dur.as_millis() as u64,
+            bytes_written,
+            encoded_frames: self.encoded_frames.load(Ordering::Relaxed),
+            skipped_frames: self.skipped_frames.load(Ordering::Relaxed),
+            bitrate_kbps,
+            encoder_name: self.config.video_encoder.clone(),
+            format_name: self.config.format.display_name().to_string(),
+        }
+    }
+
+    pub fn stop(mut self) -> Result<PathBuf> {
+        self.stop_inner()
+    }
+
+    fn stop_inner(&mut self) -> Result<PathBuf> {
+        *self.state.lock() = RecordState::Stopping;
+        self.running.store(false, Ordering::SeqCst);
+        self.video_tx.take();
+        self.audio_txs.clear();
+
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+
+        if let Some(mut child) = self.child.lock().take() {
+            let status = child.wait()?;
+            if !status.success() {
+                let err = self.stderr_log.lock().clone();
+                return Err(ObsError::Recorder(format!(
+                    "FFmpeg recorder exited with {status}: {err}"
+                )));
+            }
+        }
+
+        *self.state.lock() = RecordState::Stopped;
+        let out_path = self.config.output_path.clone();
+        if self.config.auto_remux_to_mp4 && self.config.format == RecordingFormat::Mkv {
+            let mp4 = remux_to_mp4(&out_path, None)?;
+            return Ok(mp4);
+        }
+        Ok(out_path)
+    }
+}
+
+impl Drop for RecordingSession {
+    fn drop(&mut self) {
+        if self.running.load(Ordering::Relaxed) {
+            let _ = self.stop_inner();
+        }
+    }
+}
