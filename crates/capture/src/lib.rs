@@ -7,7 +7,7 @@ use obs_platform_windows::{
 use obs_scenes::{SceneCollection, SourceKind, SourceProperties};
 use obs_video::VideoFrame;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -170,9 +170,27 @@ impl CaptureManager {
     }
 
     pub fn sync_with_collection(&self, collection: &SceneCollection) {
+        let active_audio = collection.active_audio_source_ids(None);
+        self.sync_with_collection_active(collection, &active_audio);
+    }
+
+    pub fn sync_with_collection_active(
+        &self,
+        collection: &SceneCollection,
+        active_audio: &HashSet<SourceId>,
+    ) {
         let mut desired: HashMap<SourceId, CaptureSpec> = HashMap::new();
         for (id, src) in &collection.sources {
             if let Some(spec) = CaptureSpec::from_source(src.kind, &src.properties) {
+                let is_audio_only = matches!(
+                    spec,
+                    CaptureSpec::AudioInput { .. }
+                        | CaptureSpec::AudioOutput { .. }
+                        | CaptureSpec::AppAudio { .. }
+                );
+                if is_audio_only && !active_audio.contains(id) {
+                    continue;
+                }
                 desired.insert(*id, spec);
             }
         }

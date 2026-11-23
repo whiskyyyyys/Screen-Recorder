@@ -1,6 +1,7 @@
 use crate::model::{
     BoundsType, CropRect, ItemTransform, ResolvedRenderItem, Scene, SceneItem, SourceDefinition,
-    SourceKind, SourceProperties,
+    SourceKind, SourceProperties, GLOBAL_DESKTOP_1_ID, GLOBAL_DESKTOP_2_ID, GLOBAL_MIC_1_ID,
+    GLOBAL_MIC_2_ID,
 };
 use obs_core::{ObsError, Result, SceneId, SceneItemId, SourceId, TransitionId};
 use obs_transitions::TransitionConfig;
@@ -33,34 +34,6 @@ impl SceneCollection {
                 name: "Display Capture".to_string(),
                 kind: SourceKind::DisplayCapture,
                 properties: SourceProperties::default_for(SourceKind::DisplayCapture),
-                video_filters: Vec::new(),
-                audio_filters: Vec::new(),
-                audio: Default::default(),
-            },
-        );
-
-        let desktop_audio_id = SourceId::new();
-        sources.insert(
-            desktop_audio_id,
-            SourceDefinition {
-                id: desktop_audio_id,
-                name: "Desktop Audio".to_string(),
-                kind: SourceKind::AudioOutputCapture,
-                properties: SourceProperties::default_for(SourceKind::AudioOutputCapture),
-                video_filters: Vec::new(),
-                audio_filters: Vec::new(),
-                audio: Default::default(),
-            },
-        );
-
-        let mic_id = SourceId::new();
-        sources.insert(
-            mic_id,
-            SourceDefinition {
-                id: mic_id,
-                name: "Mic/Aux".to_string(),
-                kind: SourceKind::AudioInputCapture,
-                properties: SourceProperties::default_for(SourceKind::AudioInputCapture),
                 video_filters: Vec::new(),
                 audio_filters: Vec::new(),
                 audio: Default::default(),
@@ -123,11 +96,7 @@ impl SceneCollection {
             Scene {
                 id: scene1_id,
                 name: "Main Scene".to_string(),
-                items: vec![
-                    SceneItem::new(bg_id),
-                    SceneItem::new(desktop_audio_id),
-                    SceneItem::new(mic_id),
-                ],
+                items: vec![SceneItem::new(bg_id)],
             },
             Scene {
                 id: scene2_id,
@@ -538,6 +507,165 @@ impl SceneCollection {
             &mut out,
         );
         out
+    }
+
+    /// Upserts or removes the 4 global audio capture devices configured in Settings -> Audio,
+    /// preserving any existing volume, mute, track routing, and audio filter state.
+    pub fn sync_global_audio_devices(
+        &mut self,
+        desktop_1: &str,
+        desktop_2: &str,
+        mic_1: &str,
+        mic_2: &str,
+    ) {
+        let slots = [
+            (
+                GLOBAL_DESKTOP_1_ID,
+                "Desktop Audio",
+                SourceKind::AudioOutputCapture,
+                desktop_1,
+            ),
+            (
+                GLOBAL_DESKTOP_2_ID,
+                "Desktop Audio 2",
+                SourceKind::AudioOutputCapture,
+                desktop_2,
+            ),
+            (
+                GLOBAL_MIC_1_ID,
+                "Mic/Aux",
+                SourceKind::AudioInputCapture,
+                mic_1,
+            ),
+            (
+                GLOBAL_MIC_2_ID,
+                "Mic/Aux 2",
+                SourceKind::AudioInputCapture,
+                mic_2,
+            ),
+        ];
+
+        for (slot_id, label, kind, raw_dev) in slots {
+            let trimmed = raw_dev.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Disabled") {
+                self.sources.remove(&slot_id);
+                for scene in &mut self.scenes {
+                    remove_source_refs_recursive(&mut scene.items, slot_id);
+                }
+                continue;
+            }
+
+            let normalized_id = if trimmed.eq_ignore_ascii_case("Default") {
+                "default".to_string()
+            } else {
+                trimmed.to_string()
+            };
+            let display_name = if normalized_id == "default" {
+                "Default".to_string()
+            } else {
+                label.to_string()
+            };
+            let props = match kind {
+                SourceKind::AudioOutputCapture => SourceProperties::AudioOutputCapture {
+                    device_id: normalized_id,
+                    device_name: display_name,
+                },
+                SourceKind::AudioInputCapture => SourceProperties::AudioInputCapture {
+                    device_id: normalized_id,
+                    device_name: display_name,
+                },
+                _ => unreachable!(),
+            };
+
+            if let Some(existing) = self.sources.get_mut(&slot_id) {
+                existing.name = label.to_string();
+                existing.kind = kind;
+                existing.properties = props;
+            } else {
+                self.sources.insert(
+                    slot_id,
+                    SourceDefinition {
+                        id: slot_id,
+                        name: label.to_string(),
+                        kind,
+                        properties: props,
+                        video_filters: Vec::new(),
+                        audio_filters: Vec::new(),
+                        audio: Default::default(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Computes the set of audio `SourceId`s that should be active in capture and mixing:
+    /// all enabled global audio devices plus visible audio sources in the active program scene
+    /// (and optional transitioning `from`/`to` scenes), traversing groups and nested scenes.
+    pub fn active_audio_source_ids(
+        &self,
+        transition_scenes: Option<(SceneId, SceneId)>,
+    ) -> HashSet<SourceId> {
+        let mut out = HashSet::new();
+        for gid in [
+            GLOBAL_DESKTOP_1_ID,
+            GLOBAL_DESKTOP_2_ID,
+            GLOBAL_MIC_1_ID,
+            GLOBAL_MIC_2_ID,
+        ] {
+            if self.sources.contains_key(&gid) {
+                out.insert(gid);
+            }
+        }
+
+        let mut visited = HashSet::new();
+        self.collect_active_audio_recursive(self.active_scene_id, &mut visited, &mut out);
+        if let Some((from_id, to_id)) = transition_scenes {
+            self.collect_active_audio_recursive(from_id, &mut visited, &mut out);
+            self.collect_active_audio_recursive(to_id, &mut visited, &mut out);
+        }
+        out
+    }
+
+    fn collect_active_audio_recursive(
+        &self,
+        scene_id: SceneId,
+        visited: &mut HashSet<SceneId>,
+        out: &mut HashSet<SourceId>,
+    ) {
+        if !visited.insert(scene_id) {
+            return;
+        }
+        if let Some(scene) = self.scene_by_id(scene_id) {
+            self.collect_audio_from_items(&scene.items, visited, out);
+        }
+        visited.remove(&scene_id);
+    }
+
+    fn collect_audio_from_items(
+        &self,
+        items: &[SceneItem],
+        visited: &mut HashSet<SceneId>,
+        out: &mut HashSet<SourceId>,
+    ) {
+        for item in items {
+            if !item.visible {
+                continue;
+            }
+            if let Some(children) = &item.group_children {
+                self.collect_audio_from_items(children, visited, out);
+                continue;
+            }
+            let Some(src) = self.sources.get(&item.source_id) else {
+                continue;
+            };
+            if let SourceProperties::SceneSource { scene_id: nested } = src.properties {
+                self.collect_active_audio_recursive(nested, visited, out);
+                continue;
+            }
+            if src.kind.has_audio() {
+                out.insert(item.source_id);
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

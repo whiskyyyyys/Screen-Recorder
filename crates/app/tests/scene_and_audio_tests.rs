@@ -1,9 +1,14 @@
 use obs_audio::{cubic_fader_to_mul, mul_to_cubic_fader, AudioMixer};
-use obs_core::SourceId;
+use obs_core::{Clock, SourceId};
 use obs_filters::{linear_to_db, AudioFilterInstance, AudioFilterKind};
-use obs_scenes::{SceneCollection, SourceAudioSettings, SourceKind, SourceProperties};
+use obs_scenes::{
+    SceneCollection, SourceAudioSettings, SourceKind, SourceProperties, GLOBAL_DESKTOP_1_ID,
+    GLOBAL_DESKTOP_2_ID, GLOBAL_MIC_1_ID, GLOBAL_MIC_2_ID,
+};
 use obs_settings::{AppSettings, ProfileManager, RecordingFormat};
+use obs_sources::SourceManager;
 use std::f32::consts::PI;
+use std::sync::Arc;
 
 #[test]
 fn scene_crud_nesting_groups_reference_cloning_and_import_export() {
@@ -212,4 +217,84 @@ fn settings_and_profiles_roundtrip() {
     assert_eq!(loaded.video.config.canvas_width, 2560);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn global_audio_devices_and_active_scene_audio_gating() {
+    let mut col = SceneCollection::default_starter("AudioGatingTest");
+    let s1 = col.active_scene_id;
+    let s2 = col.create_scene("Secondary").unwrap();
+
+    // QA-05: 4 Global audio slots reflect settings and preserve volume/filters on update
+    col.sync_global_audio_devices("default", "Disabled", "mic-1-id", "mic-2-id");
+    assert!(col.sources.contains_key(&GLOBAL_DESKTOP_1_ID));
+    assert!(!col.sources.contains_key(&GLOBAL_DESKTOP_2_ID));
+    assert!(col.sources.contains_key(&GLOBAL_MIC_1_ID));
+    assert!(col.sources.contains_key(&GLOBAL_MIC_2_ID));
+
+    col.sources
+        .get_mut(&GLOBAL_MIC_1_ID)
+        .unwrap()
+        .audio
+        .volume_mul = 0.75;
+    col.sync_global_audio_devices("Disabled", "desk-2-id", "mic-1-updated", "Disabled");
+    assert!(!col.sources.contains_key(&GLOBAL_DESKTOP_1_ID));
+    assert!(col.sources.contains_key(&GLOBAL_DESKTOP_2_ID));
+    assert!(!col.sources.contains_key(&GLOBAL_MIC_2_ID));
+    assert!((col.sources[&GLOBAL_MIC_1_ID].audio.volume_mul - 0.75).abs() < 1e-6);
+    let global_active = col.active_audio_source_ids(None);
+    assert!(global_active.contains(&GLOBAL_DESKTOP_2_ID));
+    assert!(global_active.contains(&GLOBAL_MIC_1_ID));
+
+    // Disable global hardware WASAPI slots before deterministic mixer isolation check
+    // so live OS audio hardware noise cannot affect synthetic tone assertions.
+    col.sync_global_audio_devices("Disabled", "Disabled", "Disabled", "Disabled");
+
+    // QA-11: Scene-specific audio sources only mix when their scene is active or transitioning
+    let (s1_aud, _) = col
+        .create_source_and_add(
+            s1,
+            "Scene 1 Media Audio",
+            SourceKind::MediaSource,
+            SourceProperties::default_for(SourceKind::MediaSource),
+        )
+        .unwrap();
+    let (s2_aud, _) = col
+        .create_source_and_add(
+            s2,
+            "Scene 2 Media Audio",
+            SourceKind::MediaSource,
+            SourceProperties::default_for(SourceKind::MediaSource),
+        )
+        .unwrap();
+
+    let active_ids = col.active_audio_source_ids(None);
+    assert!(active_ids.contains(&s1_aud));
+    assert!(!active_ids.contains(&s2_aud));
+
+    let mixer = Arc::new(AudioMixer::new(48000));
+    let mgr = SourceManager::new(Clock::new(), Arc::clone(&mixer), 30);
+    mgr.sync_collection(&col);
+
+    let tone: Vec<f32> = vec![0.4f32; 480 * 2];
+    mixer.push_interleaved_stereo(s1_aud, &tone, 48000);
+    let blk1 = mixer.mix_block(480);
+    assert!(blk1.tracks[0].iter().any(|&x| x.abs() > 0.2));
+
+    // Pushing to Scene 2 audio while Scene 1 is active must be ignored by mixer
+    mixer.push_interleaved_stereo(s2_aud, &tone, 48000);
+    let blk_ignored = mixer.mix_block(480);
+    assert!(blk_ignored.tracks[0].iter().all(|&x| x == 0.0));
+
+    // During transition (s1, s2), both scenes' audio sources are active; after switching to s2, only s2
+    mgr.sync_collection_with_transition(&col, Some((s1, s2)));
+    mixer.push_interleaved_stereo(s2_aud, &tone, 48000);
+    let blk_tr = mixer.mix_block(480);
+    assert!(blk_tr.tracks[0].iter().any(|&x| x.abs() > 0.2));
+
+    col.active_scene_id = s2;
+    mgr.sync_collection(&col);
+    mixer.push_interleaved_stereo(s1_aud, &tone, 48000);
+    let blk_after = mixer.mix_block(480);
+    assert!(blk_after.tracks[0].iter().all(|&x| x == 0.0));
 }

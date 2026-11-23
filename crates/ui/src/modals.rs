@@ -53,7 +53,7 @@ pub fn render_settings_modal(
     ctx: &egui::Context,
     st: &mut SettingsModalState,
     backend: &dyn StudioBackend,
-    status_msg: &mut Option<String>,
+    toast: &mut crate::ToastQueue,
 ) {
     if !st.open {
         return;
@@ -97,7 +97,7 @@ pub fn render_settings_modal(
                             SettingsTab::Stream => render_tab_stream(ui, st, backend),
                             SettingsTab::Output => render_tab_output(ui, &mut st.draft, backend),
                             SettingsTab::Audio => render_tab_audio(ui, &mut st.draft, backend),
-                            SettingsTab::Video => render_tab_video(ui, &mut st.draft),
+                            SettingsTab::Video => render_tab_video(ui, &mut st.draft, backend),
                             SettingsTab::Hotkeys => render_tab_hotkeys(ctx, ui, st),
                             SettingsTab::Accessibility => render_tab_a11y(ui, &mut st.draft),
                             SettingsTab::Advanced => render_tab_advanced(ui, &mut st.draft),
@@ -110,17 +110,17 @@ pub fn render_settings_modal(
             ui.horizontal(|ui| {
                 if ui.button("Apply").clicked() {
                     match backend.apply_settings(st.draft.clone()) {
-                        Ok(()) => *status_msg = Some("Settings saved and applied.".to_string()),
-                        Err(e) => *status_msg = Some(format!("Settings error: {e}")),
+                        Ok(()) => toast.push_info("Settings saved and applied."),
+                        Err(e) => toast.push_error(format!("Settings error: {e}")),
                     }
                 }
                 if ui.button("OK").clicked() {
                     match backend.apply_settings(st.draft.clone()) {
                         Ok(()) => {
                             st.open = false;
-                            *status_msg = Some("Settings saved.".to_string());
+                            toast.push_info("Settings saved.");
                         }
-                        Err(e) => *status_msg = Some(format!("Settings error: {e}")),
+                        Err(e) => toast.push_error(format!("Settings error: {e}")),
                     }
                 }
                 if ui.button("Cancel").clicked() {
@@ -554,35 +554,55 @@ fn render_tab_audio(ui: &mut Ui, s: &mut AppSettings, backend: &dyn StudioBacken
     ui.heading("Audio");
     let inputs = backend.enumerate_audio_inputs();
     let outputs = backend.enumerate_audio_outputs();
+    let output_active = backend.has_active_output();
+
+    if output_active {
+        ui.colored_label(
+            Color32::from_rgb(245, 190, 65),
+            "Sample rate & channel layout are locked while recording, streaming, or replay is active.",
+        );
+    }
 
     egui::Grid::new("aud_grid")
         .num_columns(2)
         .spacing([12.0, 8.0])
         .show(ui, |ui| {
             ui.label("Sample Rate:");
-            egui::ComboBox::from_id_salt("aud_sr")
-                .selected_text(format!("{} Hz", s.audio.sample_rate))
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut s.audio.sample_rate, 48000, "48 kHz");
-                    ui.selectable_value(&mut s.audio.sample_rate, 44100, "44.1 kHz");
-                });
+            ui.add_enabled_ui(!output_active, |ui| {
+                egui::ComboBox::from_id_salt("aud_sr")
+                    .selected_text(format!("{} Hz", s.audio.sample_rate))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.audio.sample_rate, 48000, "48 kHz");
+                        ui.selectable_value(&mut s.audio.sample_rate, 44100, "44.1 kHz");
+                    });
+            });
             ui.end_row();
 
             ui.label("Channels:");
-            egui::ComboBox::from_id_salt("aud_ch")
-                .selected_text(&s.audio.channels)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut s.audio.channels, "Stereo".to_string(), "Stereo");
-                    ui.selectable_value(&mut s.audio.channels, "Mono".to_string(), "Mono");
-                });
+            ui.add_enabled_ui(!output_active, |ui| {
+                egui::ComboBox::from_id_salt("aud_ch")
+                    .selected_text(&s.audio.channels)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut s.audio.channels, "Stereo".to_string(), "Stereo");
+                        ui.selectable_value(&mut s.audio.channels, "Mono".to_string(), "Mono");
+                    });
+            });
             ui.end_row();
 
             ui.label("Desktop Audio:");
             device_combo(ui, "desk1", &mut s.audio.desktop_device_1, &outputs);
             ui.end_row();
 
+            ui.label("Desktop Audio 2:");
+            device_combo(ui, "desk2", &mut s.audio.desktop_device_2, &outputs);
+            ui.end_row();
+
             ui.label("Mic/Auxiliary Audio:");
             device_combo(ui, "mic1", &mut s.audio.mic_device_1, &inputs);
+            ui.end_row();
+
+            ui.label("Mic/Auxiliary Audio 2:");
+            device_combo(ui, "mic2", &mut s.audio.mic_device_2, &inputs);
             ui.end_row();
 
             ui.label("Audio Monitoring Device:");
@@ -617,96 +637,105 @@ fn device_combo(
         });
 }
 
-fn render_tab_video(ui: &mut Ui, s: &mut AppSettings) {
+fn render_tab_video(ui: &mut Ui, s: &mut AppSettings, backend: &dyn StudioBackend) {
     ui.heading("Video");
+    let output_active = backend.has_active_output();
+    if output_active {
+        ui.colored_label(
+            Color32::from_rgb(245, 190, 65),
+            "Video resolution and FPS are locked while recording, streaming, or replay is active.",
+        );
+    }
     let vc = &mut s.video.config;
-    egui::Grid::new("vid_grid")
-        .num_columns(2)
-        .spacing([12.0, 8.0])
-        .show(ui, |ui| {
-            ui.label("Base (Canvas) Resolution:");
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::DragValue::new(&mut vc.canvas_width)
-                        .range(320..=3840)
-                        .speed(2),
-                );
-                ui.label("x");
-                ui.add(
-                    egui::DragValue::new(&mut vc.canvas_height)
-                        .range(240..=2160)
-                        .speed(2),
-                );
-                for (lw, lh) in [(1920, 1080), (1920, 1200), (2560, 1440), (1280, 720)] {
-                    if ui.small_button(format!("{lw}x{lh}")).clicked() {
-                        vc.canvas_width = lw;
-                        vc.canvas_height = lh;
-                    }
-                }
-            });
-            ui.end_row();
-
-            ui.label("Output (Scaled) Resolution:");
-            ui.horizontal(|ui| {
-                ui.add(
-                    egui::DragValue::new(&mut vc.output_width)
-                        .range(320..=3840)
-                        .speed(2),
-                );
-                ui.label("x");
-                ui.add(
-                    egui::DragValue::new(&mut vc.output_height)
-                        .range(240..=2160)
-                        .speed(2),
-                );
-                for (lw, lh) in [(1920, 1080), (1280, 720), (852, 480)] {
-                    if ui.small_button(format!("{lw}x{lh}")).clicked() {
-                        vc.output_width = lw;
-                        vc.output_height = lh;
-                    }
-                }
-            });
-            ui.end_row();
-
-            ui.label("Downscale Filter:");
-            egui::ComboBox::from_id_salt("scale_flt")
-                .selected_text(vc.scale_filter.display_name())
-                .show_ui(ui, |ui| {
-                    for f in [
-                        ScaleFilter::Point,
-                        ScaleFilter::Bilinear,
-                        ScaleFilter::Bicubic,
-                        ScaleFilter::Lanczos,
-                        ScaleFilter::Area,
-                    ] {
-                        ui.selectable_value(&mut vc.scale_filter, f, f.display_name());
-                    }
-                });
-            ui.end_row();
-
-            ui.label("Common FPS Values:");
-            egui::ComboBox::from_id_salt("fps_sel")
-                .selected_text(format!("{:.2} FPS", vc.fps_f64()))
-                .show_ui(ui, |ui| {
-                    for (num, den, lbl) in [
-                        (60, 1, "60 FPS"),
-                        (5994, 100, "59.94 FPS"),
-                        (48, 1, "48 FPS"),
-                        (30, 1, "30 FPS"),
-                        (2997, 100, "29.97 FPS"),
-                        (24, 1, "24 FPS"),
-                    ] {
-                        if ui
-                            .selectable_label(vc.fps_num == num && vc.fps_den == den, lbl)
-                            .clicked()
-                        {
-                            vc.fps_num = num;
-                            vc.fps_den = den;
+    ui.add_enabled_ui(!output_active, |ui| {
+        egui::Grid::new("vid_grid")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Base (Canvas) Resolution:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut vc.canvas_width)
+                            .range(320..=3840)
+                            .speed(2),
+                    );
+                    ui.label("x");
+                    ui.add(
+                        egui::DragValue::new(&mut vc.canvas_height)
+                            .range(240..=2160)
+                            .speed(2),
+                    );
+                    for (lw, lh) in [(1920, 1080), (1920, 1200), (2560, 1440), (1280, 720)] {
+                        if ui.small_button(format!("{lw}x{lh}")).clicked() {
+                            vc.canvas_width = lw;
+                            vc.canvas_height = lh;
                         }
                     }
                 });
-            ui.end_row();
-        });
+                ui.end_row();
+
+                ui.label("Output (Scaled) Resolution:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut vc.output_width)
+                            .range(320..=3840)
+                            .speed(2),
+                    );
+                    ui.label("x");
+                    ui.add(
+                        egui::DragValue::new(&mut vc.output_height)
+                            .range(240..=2160)
+                            .speed(2),
+                    );
+                    for (lw, lh) in [(1920, 1080), (1280, 720), (852, 480)] {
+                        if ui.small_button(format!("{lw}x{lh}")).clicked() {
+                            vc.output_width = lw;
+                            vc.output_height = lh;
+                        }
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Downscale Filter:");
+                egui::ComboBox::from_id_salt("scale_flt")
+                    .selected_text(vc.scale_filter.display_name())
+                    .show_ui(ui, |ui| {
+                        for f in [
+                            ScaleFilter::Point,
+                            ScaleFilter::Bilinear,
+                            ScaleFilter::Bicubic,
+                            ScaleFilter::Lanczos,
+                            ScaleFilter::Area,
+                        ] {
+                            ui.selectable_value(&mut vc.scale_filter, f, f.display_name());
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Common FPS Values:");
+                egui::ComboBox::from_id_salt("fps_sel")
+                    .selected_text(format!("{:.2} FPS", vc.fps_f64()))
+                    .show_ui(ui, |ui| {
+                        for (num, den, lbl) in [
+                            (60, 1, "60 FPS"),
+                            (5994, 100, "59.94 FPS"),
+                            (48, 1, "48 FPS"),
+                            (30, 1, "30 FPS"),
+                            (2997, 100, "29.97 FPS"),
+                            (24, 1, "24 FPS"),
+                        ] {
+                            if ui
+                                .selectable_label(vc.fps_num == num && vc.fps_den == den, lbl)
+                                .clicked()
+                            {
+                                vc.fps_num = num;
+                                vc.fps_den = den;
+                            }
+                        }
+                    });
+                ui.end_row();
+            });
+    });
 }
 
 fn render_tab_hotkeys(ctx: &egui::Context, ui: &mut Ui, st: &mut SettingsModalState) {
@@ -838,6 +867,7 @@ fn render_tab_advanced(ui: &mut Ui, s: &mut AppSettings) {
         &mut s.advanced.dynamic_bitrate,
         "Dynamically change bitrate to manage congestion",
     );
+    ui.small("Applies AIMD congestion bitrate adaptation on RTMP/RTMPS streams (not direct SRT).");
 
     ui.separator();
     ui.label(RichText::new("OBS WebSocket 5.x Server").strong());
@@ -911,7 +941,7 @@ pub fn render_add_source_modal(
     ctx: &egui::Context,
     st: &mut AddSourceModalState,
     backend: &dyn StudioBackend,
-    status_msg: &mut Option<String>,
+    toast: &mut crate::ToastQueue,
     props_modal: &mut Option<SourceId>,
 ) {
     if !st.open {
@@ -964,12 +994,12 @@ pub fn render_add_source_modal(
                                 st.open = false;
                                 *props_modal = Some(sid);
                             }
-                            Err(e) => *status_msg = Some(e),
+                            Err(e) => toast.push_error(e),
                         }
                     } else if let Some(existing_id) = st.selected_existing {
                         match backend.add_existing_source(active_scene, existing_id) {
                             Ok(_) => st.open = false,
-                            Err(e) => *status_msg = Some(e),
+                            Err(e) => toast.push_error(e),
                         }
                     }
                 }
@@ -2232,7 +2262,7 @@ pub fn render_autoconfig_modal(
     ctx: &egui::Context,
     st: &mut AutoConfigModalState,
     backend: &dyn StudioBackend,
-    status_msg: &mut Option<String>,
+    toast: &mut crate::ToastQueue,
 ) {
     if !st.open {
         return;
@@ -2280,10 +2310,10 @@ pub fn render_autoconfig_modal(
                     cfg.output.rec_bitrate_kbps = 20000;
                     match backend.apply_settings(cfg) {
                         Ok(()) => {
-                            *status_msg = Some("Auto-Configuration applied.".to_string());
+                            toast.push_info("Auto-Configuration applied.");
                             st.open = false;
                         }
-                        Err(e) => *status_msg = Some(e),
+                        Err(e) => toast.push_error(e),
                     }
                 }
                 if ui.button("Cancel").clicked() {

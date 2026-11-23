@@ -1,5 +1,6 @@
 param(
-    [switch]$SkipBuild = $false
+    [switch]$SkipBuild = $false,
+    [switch]$AllowSkipInstaller = $false
 )
 
 $ErrorActionPreference = 'Stop'
@@ -75,8 +76,13 @@ $Iscc = $IsccCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 if ($Iscc) {
     Write-Host "Compiling Windows Installer via $Iscc..."
     & $Iscc (Join-Path $PSScriptRoot "installer.iss")
+    if ($LASTEXITCODE -ne 0) {
+        throw "ISCC.exe failed with exit code $LASTEXITCODE"
+    }
+} elseif ($AllowSkipInstaller) {
+    Write-Warning "ISCC.exe (Inno Setup 6) not found - skipped Setup EXE build (-AllowSkipInstaller set)."
 } else {
-    Write-Warning "ISCC.exe (Inno Setup 6) not found - skipped Setup EXE build."
+    throw "ISCC.exe (Inno Setup 6) not found. Install Inno Setup 6 or pass -AllowSkipInstaller."
 }
 
 Get-ChildItem $DistDir -File | Select-Object Name, Length | Format-Table -AutoSize

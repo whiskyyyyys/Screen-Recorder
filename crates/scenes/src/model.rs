@@ -537,3 +537,31 @@ pub struct ResolvedRenderItem {
     pub blend_mode: BlendMode,
     pub filters: Vec<VideoFilterInstance>,
 }
+
+/// Deterministic SourceIds for OBS-style global desktop & mic/aux audio devices.
+pub const GLOBAL_DESKTOP_1_ID: SourceId =
+    SourceId::from_u128(0x4F58_4944_4501_0000_0000_0000_0000_0001);
+pub const GLOBAL_DESKTOP_2_ID: SourceId =
+    SourceId::from_u128(0x4F58_4944_4501_0000_0000_0000_0000_0002);
+pub const GLOBAL_MIC_1_ID: SourceId =
+    SourceId::from_u128(0x4F58_4944_4501_0000_0000_0000_0000_0003);
+pub const GLOBAL_MIC_2_ID: SourceId =
+    SourceId::from_u128(0x4F58_4944_4501_0000_0000_0000_0000_0004);
+
+pub fn global_audio_slot_order(id: SourceId) -> Option<usize> {
+    if id == GLOBAL_DESKTOP_1_ID {
+        Some(0)
+    } else if id == GLOBAL_DESKTOP_2_ID {
+        Some(1)
+    } else if id == GLOBAL_MIC_1_ID {
+        Some(2)
+    } else if id == GLOBAL_MIC_2_ID {
+        Some(3)
+    } else {
+        None
+    }
+}
+
+pub fn is_global_audio_source_id(id: SourceId) -> bool {
+    global_audio_slot_order(id).is_some()
+}

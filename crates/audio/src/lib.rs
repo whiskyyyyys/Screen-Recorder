@@ -152,9 +152,9 @@ impl AudioMixer {
         };
 
         let mut map = self.channels.lock();
-        let ch = map
-            .entry(source_id)
-            .or_insert_with(|| ChannelState::new(SourceAudioSettings::default(), Vec::new()));
+        let Some(ch) = map.get_mut(&source_id) else {
+            return;
+        };
 
         let max_samples = (target_sr as usize) * 2; // 1 second cap to prevent drift buildup
         for &s in src_slice {

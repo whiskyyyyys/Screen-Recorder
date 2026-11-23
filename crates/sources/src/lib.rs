@@ -7,7 +7,7 @@ use image::{codecs::gif::GifDecoder, AnimationDecoder};
 use media_player::{MediaSpec, MediaWorker};
 use obs_audio::AudioMixer;
 use obs_capture::CaptureManager;
-use obs_core::{Clock, SourceId};
+use obs_core::{Clock, SceneId, SourceId};
 use obs_scenes::{SceneCollection, SourceKind, SourceProperties};
 use obs_video::VideoFrame;
 use parking_lot::Mutex;
@@ -101,14 +101,25 @@ impl SourceManager {
         self.plugin_frames.lock().insert(source_id, frame);
     }
 
-    /// Synchronizes background capture, media, browser, and audio mixer state with `collection`.
+    /// Synchronizes background capture, media, browser, and audio mixer state with `collection`,
+    /// gating audio capture and mixing to active program/transition scenes + enabled global devices.
     pub fn sync_collection(&self, collection: &SceneCollection) {
-        self.capture.sync_with_collection(collection);
+        self.sync_collection_with_transition(collection, None);
+    }
 
-        // Sync audio mixer channels
+    pub fn sync_collection_with_transition(
+        &self,
+        collection: &SceneCollection,
+        transition_scenes: Option<(SceneId, SceneId)>,
+    ) {
+        let active_audio = collection.active_audio_source_ids(transition_scenes);
+        self.capture
+            .sync_with_collection_active(collection, &active_audio);
+
+        // Sync audio mixer channels ONLY for active audio sources + enabled global audio devices
         let mut audio_desired = Vec::new();
         for (id, src) in &collection.sources {
-            if src.kind.has_audio() {
+            if src.kind.has_audio() && active_audio.contains(id) {
                 audio_desired.push((*id, src.audio.clone(), src.audio_filters.clone()));
             }
         }

@@ -1,4 +1,4 @@
-use crate::named_pipe::WindowsNamedPipe;
+use crate::named_pipe::{PipeCancelToken, WindowsNamedPipe};
 use crossbeam_channel::{bounded, Sender};
 use obs_core::{ObsError, ReplayBufferState, ReplayStats, Result};
 use obs_encoder::{build_video_encoder_args, locate_ffmpeg, VideoEncodeParams};
@@ -58,6 +58,7 @@ pub struct ReplayBufferSession {
     last_saved: Arc<Mutex<Option<String>>>,
     ffmpeg_path: PathBuf,
     child: Arc<Mutex<Option<Child>>>,
+    pipe_cancel: Arc<PipeCancelToken>,
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -66,6 +67,7 @@ impl ReplayBufferSession {
         let ffmpeg = locate_ffmpeg()?;
         let pipe_name = format!("obs-rust-replay-{}", Uuid::new_v4());
         let mut pipe = WindowsNamedPipe::create(&pipe_name)?;
+        let pipe_cancel = pipe.cancel_token();
         let pipe_path = pipe.path.clone();
 
         let (audio_tx, audio_rx) = bounded::<Vec<u8>>(128);
@@ -225,6 +227,7 @@ impl ReplayBufferSession {
             last_saved: Arc::new(Mutex::new(None)),
             ffmpeg_path: ffmpeg,
             child: Arc::new(Mutex::new(Some(child))),
+            pipe_cancel,
             threads,
         })
     }
@@ -256,11 +259,36 @@ impl ReplayBufferSession {
     }
 
     pub fn save_replay(&self, out_path: &Path) -> Result<PathBuf> {
+        struct SavingStateGuard<'a> {
+            state: &'a Mutex<ReplayBufferState>,
+            running: &'a AtomicBool,
+            tmp_path: Option<PathBuf>,
+        }
+        impl Drop for SavingStateGuard<'_> {
+            fn drop(&mut self) {
+                if let Some(p) = &self.tmp_path {
+                    let _ = fs::remove_file(p);
+                }
+                let next = if self.running.load(Ordering::Relaxed) {
+                    ReplayBufferState::Active
+                } else {
+                    ReplayBufferState::Stopped
+                };
+                *self.state.lock() = next;
+            }
+        }
+
         *self.state.lock() = ReplayBufferState::Saving;
+        let tmp_mkv = out_path.with_extension("replay_tmp.mkv");
+        let _guard = SavingStateGuard {
+            state: &self.state,
+            running: &self.running,
+            tmp_path: Some(tmp_mkv.clone()),
+        };
+
         let (header, clusters): (Vec<u8>, Vec<ReplayCluster>) = {
             let r = self.ring.lock();
             if r.header.is_empty() || r.clusters.is_empty() {
-                *self.state.lock() = ReplayBufferState::Active;
                 return Err(ObsError::Recorder(
                     "Replay buffer does not yet have enough buffered video clusters".to_string(),
                 ));
@@ -271,7 +299,6 @@ impl ReplayBufferSession {
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp_mkv = out_path.with_extension("replay_tmp.mkv");
         {
             let mut f = File::create(&tmp_mkv)?;
             f.write_all(&header)?;
@@ -300,9 +327,7 @@ impl ReplayBufferSession {
                 &out_path.to_string_lossy(),
             ])
             .output()?;
-        let _ = fs::remove_file(&tmp_mkv);
 
-        *self.state.lock() = ReplayBufferState::Active;
         if !out.status.success() {
             return Err(ObsError::Recorder(format!(
                 "Failed saving replay: {}",
@@ -316,6 +341,7 @@ impl ReplayBufferSession {
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        self.pipe_cancel.cancel();
         *self.state.lock() = ReplayBufferState::Stopped;
         if let Some(mut c) = self.child.lock().take() {
             let _ = c.kill();

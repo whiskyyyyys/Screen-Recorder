@@ -23,7 +23,7 @@ use obs_streamer::{
     load_streaming_services, StreamSession, StreamSessionConfig, StreamingServiceEntry,
 };
 use obs_transitions::ActiveTransition;
-use obs_ui::StudioBackend;
+use obs_ui::{StudioBackend, UiNotice};
 use obs_websocket::{
     start_websocket_server, WebSocketBackend, WebSocketConfig, WebSocketServerHandle,
 };
@@ -31,7 +31,7 @@ use parking_lot::{Mutex, RwLock};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -65,7 +65,8 @@ pub struct ObsEngine {
     audio_thread: Mutex<Option<JoinHandle<()>>>,
 
     stats_snapshot: RwLock<EngineStats>,
-    notices: Mutex<VecDeque<String>>,
+    notice_seq: AtomicU64,
+    notices: Mutex<VecDeque<UiNotice>>,
     last_frame_instant: Mutex<Instant>,
     last_encode_instant: Mutex<Instant>,
     render_time_ema: Mutex<f64>,
@@ -85,7 +86,7 @@ impl ObsEngine {
             .unwrap_or_default();
 
         let col_path = profile_mgr.collection_path(&root_state.active_collection);
-        let collection = if col_path.exists() {
+        let mut collection = if col_path.exists() {
             SceneCollection::load_from_file(&col_path)
                 .unwrap_or_else(|_| SceneCollection::default_starter(&root_state.active_collection))
         } else {
@@ -93,6 +94,8 @@ impl ObsEngine {
             let _ = def.save_to_file(&col_path);
             def
         };
+        Self::sync_global_audio_into_collection(&mut collection, &settings.audio);
+        let _ = collection.save_to_file(&col_path);
 
         let audio_mixer = Arc::new(AudioMixer::new(settings.audio.sample_rate));
         audio_mixer.set_global_mono(settings.audio.channels == "Mono");
@@ -153,6 +156,7 @@ impl ObsEngine {
             audio_thread_running: Arc::new(AtomicBool::new(true)),
             audio_thread: Mutex::new(None),
             stats_snapshot: RwLock::new(EngineStats::default()),
+            notice_seq: AtomicU64::new(0),
             notices: Mutex::new(VecDeque::with_capacity(16)),
             last_frame_instant: Mutex::new(Instant::now()),
             last_encode_instant: Mutex::new(Instant::now()),
@@ -183,12 +187,54 @@ impl ObsEngine {
     }
 
     fn push_notice(&self, msg: impl Into<String>) {
-        let m = msg.into();
+        self.push_notice_kind(msg, false);
+    }
+
+    fn push_error_notice(&self, msg: impl Into<String>) {
+        self.push_notice_kind(msg, true);
+    }
+
+    fn push_notice_kind(&self, msg: impl Into<String>, is_error: bool) {
+        let id = self.notice_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let notice = UiNotice {
+            id,
+            message: msg.into(),
+            is_error,
+        };
         let mut q = self.notices.lock();
         if q.len() >= 16 {
             q.pop_front();
         }
-        q.push_back(m);
+        q.push_back(notice);
+    }
+
+    pub fn is_output_active(&self) -> bool {
+        self.recorder.lock().is_some()
+            || self.streamer.lock().is_some()
+            || self.replay_buf.lock().is_some()
+    }
+
+    fn sync_global_audio_into_collection(
+        col: &mut SceneCollection,
+        audio: &obs_settings::AudioSettings,
+    ) {
+        col.sync_global_audio_devices(
+            &audio.desktop_device_1,
+            &audio.desktop_device_2,
+            &audio.mic_device_1,
+            &audio.mic_device_2,
+        );
+    }
+
+    fn sync_active_sources(&self) {
+        let col = self.collection.read().clone();
+        let tr_scenes = self
+            .active_transition
+            .lock()
+            .as_ref()
+            .map(|tr| (tr.from_scene, tr.to_scene));
+        self.source_mgr
+            .sync_collection_with_transition(&col, tr_scenes);
     }
 
     fn start_audio_thread(self: &Arc<Self>) {
@@ -264,7 +310,9 @@ impl ObsEngine {
         let eng = Arc::downgrade(self);
         let listener = HotkeyListener::start(cfg.bindings, cfg.enabled, move |action| {
             if let Some(e) = eng.upgrade() {
-                let _ = e.handle_hotkey_action(&action);
+                if let Err(err) = e.handle_hotkey_action(&action) {
+                    e.push_error_notice(err);
+                }
             }
         });
         *self.hotkey_listener.lock() = Some(listener);
@@ -512,6 +560,7 @@ impl StudioBackend for ObsEngine {
                 scene_id: new_prog,
                 scene_name: sname,
             });
+            self.sync_active_sources();
         }
 
         let col = self.collection.read().clone();
@@ -689,8 +738,12 @@ impl StudioBackend for ObsEngine {
         self.source_mgr.source_errors()
     }
 
-    fn recent_notices(&self) -> Vec<String> {
+    fn recent_notices(&self) -> Vec<UiNotice> {
         self.notices.lock().drain(..).collect()
+    }
+
+    fn has_active_output(&self) -> bool {
+        self.is_output_active()
     }
 
     fn settings(&self) -> AppSettings {
@@ -698,6 +751,22 @@ impl StudioBackend for ObsEngine {
     }
 
     fn apply_settings(&self, new_settings: AppSettings) -> Result<(), String> {
+        {
+            let old = self.settings.read();
+            let format_locked_changed = old.video.config.canvas_width
+                != new_settings.video.config.canvas_width
+                || old.video.config.canvas_height != new_settings.video.config.canvas_height
+                || old.video.config.output_width != new_settings.video.config.output_width
+                || old.video.config.output_height != new_settings.video.config.output_height
+                || old.video.config.fps_num != new_settings.video.config.fps_num
+                || old.video.config.fps_den != new_settings.video.config.fps_den
+                || old.audio.sample_rate != new_settings.audio.sample_rate
+                || old.audio.channels != new_settings.audio.channels;
+            if format_locked_changed && self.is_output_active() {
+                return Err("Cannot change video resolution, FPS, or audio sample rate/channels while recording, streaming, or replay buffer is active. Stop active outputs first.".to_string());
+            }
+        }
+
         let profile = self.root_state.read().active_profile.clone();
         self.profile_mgr
             .save_profile(&profile, &new_settings)
@@ -728,6 +797,12 @@ impl StudioBackend for ObsEngine {
             );
         }
 
+        {
+            let mut col = self.collection.write();
+            Self::sync_global_audio_into_collection(&mut col, &new_settings.audio);
+        }
+        self.save_active_collection();
+
         let ws_changed = {
             let old = self.settings.read();
             old.advanced.websocket_enabled != new_settings.advanced.websocket_enabled
@@ -739,6 +814,7 @@ impl StudioBackend for ObsEngine {
         };
 
         *self.settings.write() = new_settings;
+        self.sync_active_sources();
         if ws_changed {
             if let Some(eng) = self.self_weak.lock().upgrade() {
                 eng.restart_websocket_if_enabled();
@@ -762,12 +838,11 @@ impl StudioBackend for ObsEngine {
     }
 
     fn with_collection_mut(&self, f: &mut dyn FnMut(&mut SceneCollection)) {
-        let col_snapshot = {
+        {
             let mut col = self.collection.write();
             f(&mut col);
-            col.clone()
-        };
-        self.source_mgr.sync_collection(&col_snapshot);
+        }
+        self.sync_active_sources();
         self.save_active_collection();
     }
 
@@ -828,6 +903,7 @@ impl StudioBackend for ObsEngine {
                 scene_name: target_name,
             });
         }
+        self.sync_active_sources();
         self.save_active_collection();
     }
 
@@ -874,23 +950,32 @@ impl StudioBackend for ObsEngine {
                 .scene_by_id(preview_id)
                 .map(|s| s.name.clone())
                 .unwrap_or_default();
+            drop(w);
             self.events.publish(EngineEvent::SceneSwitched {
                 scene_id: preview_id,
                 scene_name: sname,
             });
+            self.sync_active_sources();
         } else if p <= 0.01 {
-            *self.active_transition.lock() = None;
+            let had_tr = self.active_transition.lock().take().is_some();
+            if had_tr {
+                self.sync_active_sources();
+            }
         } else {
             let tr = col
                 .active_transition()
                 .cloned()
                 .unwrap_or_else(|| obs_transitions::TransitionConfig::default_presets()[1].clone());
+            let was_none = self.active_transition.lock().is_none();
             *self.active_transition.lock() = Some(ActiveTransition::set_t_bar(
                 tr,
                 col.active_scene_id,
                 preview_id,
                 p,
             ));
+            if was_none {
+                self.sync_active_sources();
+            }
         }
     }
 
@@ -945,6 +1030,7 @@ impl StudioBackend for ObsEngine {
             .write()
             .delete_scene(id)
             .map_err(|e| e.to_string())?;
+        self.sync_active_sources();
         self.events.publish(EngineEvent::SceneListChanged);
         self.save_active_collection();
         Ok(())
@@ -968,7 +1054,7 @@ impl StudioBackend for ObsEngine {
             .write()
             .create_source_and_add(scene_id, name, kind, props)
             .map_err(|e| e.to_string())?;
-        self.source_mgr.sync_collection(&self.collection.read());
+        self.sync_active_sources();
         self.save_active_collection();
         Ok(res)
     }
@@ -983,7 +1069,7 @@ impl StudioBackend for ObsEngine {
             .write()
             .add_existing_source_to_scene(scene_id, source_id)
             .map_err(|e| e.to_string())?;
-        self.source_mgr.sync_collection(&self.collection.read());
+        self.sync_active_sources();
         self.save_active_collection();
         Ok(res)
     }
@@ -993,7 +1079,7 @@ impl StudioBackend for ObsEngine {
             .write()
             .remove_scene_item(scene_id, item_id)
             .map_err(|e| e.to_string())?;
-        self.source_mgr.sync_collection(&self.collection.read());
+        self.sync_active_sources();
         self.save_active_collection();
         Ok(())
     }
@@ -1276,6 +1362,12 @@ impl StudioBackend for ObsEngine {
     }
 
     fn switch_profile(&self, name: &str) -> Result<(), String> {
+        if self.is_output_active() {
+            return Err(
+                "Cannot switch profiles while recording, streaming, or replay buffer is active."
+                    .to_string(),
+            );
+        }
         let new_settings = self
             .profile_mgr
             .load_profile(name)
@@ -1342,7 +1434,7 @@ impl StudioBackend for ObsEngine {
     fn switch_collection(&self, name: &str) -> Result<(), String> {
         self.save_active_collection();
         let path = self.profile_mgr.collection_path(name);
-        let col = if path.exists() {
+        let mut col = if path.exists() {
             SceneCollection::load_from_file(&path).map_err(|e| e.to_string())?
         } else {
             let def = SceneCollection::default_starter(name);
@@ -1350,12 +1442,17 @@ impl StudioBackend for ObsEngine {
             def
         };
         {
+            let audio_cfg = self.settings.read().audio.clone();
+            Self::sync_global_audio_into_collection(&mut col, &audio_cfg);
+        }
+        {
             let mut rs = self.root_state.write();
             rs.active_collection = name.to_string();
             let _ = self.profile_mgr.save_root_state(&rs);
         }
-        self.source_mgr.sync_collection(&col);
         *self.collection.write() = col;
+        self.sync_active_sources();
+        self.save_active_collection();
         self.events.publish(EngineEvent::SceneCollectionChanged {
             collection: name.to_string(),
         });
@@ -1643,6 +1740,9 @@ impl WebSocketBackend for ObsEngine {
             .get_mut(idx)
             .ok_or_else(|| "Scene item not found".to_string())?;
         item.visible = enabled;
+        drop(col);
+        self.sync_active_sources();
+        self.save_active_collection();
         Ok(())
     }
 
@@ -1771,7 +1871,7 @@ impl WebSocketBackend for ObsEngine {
             src.audio.volume_mul = mul;
             (src.id, src.name.clone())
         };
-        self.source_mgr.sync_collection(&self.collection.read());
+        self.sync_active_sources();
         self.events.publish(EngineEvent::SourceVolumeChanged {
             source_id: sid,
             name: sname,
@@ -1802,7 +1902,7 @@ impl WebSocketBackend for ObsEngine {
             src.audio.muted = muted;
             (src.id, src.name.clone())
         };
-        self.source_mgr.sync_collection(&self.collection.read());
+        self.sync_active_sources();
         self.events.publish(EngineEvent::SourceMuteChanged {
             source_id: sid,
             name: sname,

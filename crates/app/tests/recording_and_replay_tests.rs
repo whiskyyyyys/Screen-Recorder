@@ -1,8 +1,11 @@
+use obs_core::ReplayBufferState;
 use obs_encoder::{locate_ffprobe, probe_all_encoders, resolve_best_video_encoder};
 use obs_recorder::{
     remux_to_mp4, RecordingConfig, RecordingSession, ReplayBufferConfig, ReplayBufferSession,
 };
+use obs_rust::engine::ObsEngine;
 use obs_settings::RecordingFormat;
+use obs_ui::StudioBackend;
 use obs_video::{rgba_to_nv12, ColorRange, ColorSpace};
 use std::process::Command;
 use std::time::Duration;
@@ -175,7 +178,7 @@ fn real_multitrack_mkv_pause_resume_remux_and_hw_encoder() {
     assert!(fmp4_probe["streams"].as_array().unwrap().len() >= 2);
 
     // Replay Buffer EBML cluster ring & Save Replay
-    let rb = ReplayBufferSession::start(ReplayBufferConfig {
+    let mut rb = ReplayBufferSession::start(ReplayBufferConfig {
         width: 320,
         height: 240,
         fps: 30,
@@ -190,16 +193,104 @@ fn real_multitrack_mkv_pause_resume_remux_and_hw_encoder() {
     })
     .expect("ReplayBufferSession::start failed");
 
+    // QA-09: Early save error before clusters accumulate must return Err and leave state Active
+    let early_err = rb.save_replay(&tmp_dir.join("early_fail.mp4"));
+    assert!(early_err.is_err());
+    assert_eq!(rb.stats().state, ReplayBufferState::Active);
+
     for i in 0..65u8 {
         rb.push_video_nv12(&synthetic_nv12_frame(320, 240, i));
         rb.push_audio_f32(&tracks[0]);
         std::thread::sleep(Duration::from_millis(20));
     }
+
+    // QA-09: Post-buffer mux failure (invalid extension) must still reset state back to Active
+    let mux_err = rb.save_replay(&tmp_dir.join("bad_mux.unsupported_ext_xyz"));
+    assert!(mux_err.is_err());
+    assert_eq!(rb.stats().state, ReplayBufferState::Active);
+
     let replay_out = tmp_dir.join("saved_replay.mp4");
     let _ = std::fs::remove_file(&replay_out);
     let saved_rb = rb.save_replay(&replay_out).expect("save_replay failed");
     let rb_probe = ffprobe_json(&saved_rb);
     assert!(rb_probe["streams"].as_array().unwrap().len() >= 2);
+    rb.stop();
+
+    // QA-02: Existing output file must not be overwritten on duplicate filename
+    let existing = tmp_dir.join("do_not_overwrite.mkv");
+    std::fs::write(&existing, b"SENTINEL_KEEP_BYTES").unwrap();
+    let dup_res = RecordingSession::start(RecordingConfig {
+        output_path: existing.clone(),
+        format: RecordingFormat::Mkv,
+        width: 320,
+        height: 240,
+        fps: 30,
+        sample_rate: 48000,
+        video_encoder: "libx264".to_string(),
+        audio_encoder: "aac".to_string(),
+        rate_control: "CBR".to_string(),
+        bitrate_kbps: 1500,
+        crf: 22,
+        preset: "speed".to_string(),
+        keyint_sec: 1,
+        audio_track_mask: 1,
+        audio_bitrate_kbps: 128,
+        color_space: ColorSpace::Rec709,
+        color_range: ColorRange::Partial,
+        auto_remux_to_mp4: false,
+    });
+    assert!(
+        dup_res.is_err(),
+        "Expected RecordingSession::start to refuse overwriting existing file"
+    );
+    assert_eq!(std::fs::read(&existing).unwrap(), b"SENTINEL_KEEP_BYTES");
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn engine_locks_output_format_settings_while_recording_active() {
+    let eng = ObsEngine::initialize(true);
+    let orig = eng.settings();
+    let tmp_rec_dir = std::env::temp_dir().join("obs_rust_lock_test");
+    let _ = std::fs::create_dir_all(&tmp_rec_dir);
+
+    let mut cfg = orig.clone();
+    cfg.output.rec_path = tmp_rec_dir.to_string_lossy().to_string();
+    cfg.output.rec_filename_format = "lock_probe".to_string();
+    cfg.output.rec_format = RecordingFormat::Mkv;
+    cfg.output.rec_video_encoder = "libx264".to_string();
+    let _ = std::fs::remove_file(tmp_rec_dir.join("lock_probe.mkv"));
+
+    eng.apply_settings(cfg.clone())
+        .expect("Applying settings while idle should succeed");
+    eng.start_recording()
+        .expect("Starting recording on headless engine should succeed");
+    assert!(eng.has_active_output());
+
+    // Changing video resolution/FPS or audio sample rate while active MUST be rejected
+    let mut bad_video = cfg.clone();
+    bad_video.video.config.output_width = 640;
+    bad_video.video.config.output_height = 360;
+    assert!(eng.apply_settings(bad_video).is_err());
+
+    let mut bad_audio = cfg.clone();
+    bad_audio.audio.sample_rate = if cfg.audio.sample_rate == 48000 {
+        44100
+    } else {
+        48000
+    };
+    assert!(eng.apply_settings(bad_audio).is_err());
+
+    // Non-format setting (e.g. confirm dialog) while active should still succeed
+    let mut safe_change = cfg;
+    safe_change.general.confirm_on_record_stop = !safe_change.general.confirm_on_record_stop;
+    assert!(eng.apply_settings(safe_change).is_ok());
+
+    let recorded = eng.stop_recording().expect("Stop recording failed");
+    assert!(!eng.has_active_output());
+    let _ = eng.apply_settings(orig);
+    eng.shutdown();
+    let _ = std::fs::remove_file(recorded);
+    let _ = std::fs::remove_dir_all(&tmp_rec_dir);
 }

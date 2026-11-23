@@ -118,17 +118,18 @@ impl WasapiCaptureStream {
                 AudioEndpointKind::Output => eRender,
             };
 
-            let dev: IMMDevice = if device_id == "default" || device_id.is_empty() {
-                enumerator
-                    .GetDefaultAudioEndpoint(flow, eConsole)
-                    .map_err(|e| ObsError::Audio(format!("GetDefaultAudioEndpoint: {e}")))?
-            } else {
-                let wide = HSTRING::from(device_id);
-                enumerator
-                    .GetDevice(PCWSTR(wide.as_ptr()))
-                    .or_else(|_| enumerator.GetDefaultAudioEndpoint(flow, eConsole))
-                    .map_err(|e| ObsError::Audio(format!("GetDevice: {e}")))?
-            };
+            let dev: IMMDevice =
+                if device_id.eq_ignore_ascii_case("default") || device_id.is_empty() {
+                    enumerator
+                        .GetDefaultAudioEndpoint(flow, eConsole)
+                        .map_err(|e| ObsError::Audio(format!("GetDefaultAudioEndpoint: {e}")))?
+                } else {
+                    let wide = HSTRING::from(device_id);
+                    enumerator
+                        .GetDevice(PCWSTR(wide.as_ptr()))
+                        .or_else(|_| enumerator.GetDefaultAudioEndpoint(flow, eConsole))
+                        .map_err(|e| ObsError::Audio(format!("GetDevice: {e}")))?
+                };
 
             let audio_client: IAudioClient = dev
                 .Activate(CLSCTX_ALL, None)
@@ -356,17 +357,18 @@ impl WasapiRenderStream {
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
                     .map_err(|e| ObsError::Audio(format!("MMDeviceEnumerator: {e}")))?;
-            let dev: IMMDevice = if device_id == "default" || device_id.is_empty() {
-                enumerator
-                    .GetDefaultAudioEndpoint(eRender, eConsole)
-                    .map_err(|e| ObsError::Audio(format!("GetDefaultAudioEndpoint: {e}")))?
-            } else {
-                let wide = HSTRING::from(device_id);
-                enumerator
-                    .GetDevice(PCWSTR(wide.as_ptr()))
-                    .or_else(|_| enumerator.GetDefaultAudioEndpoint(eRender, eConsole))
-                    .map_err(|e| ObsError::Audio(format!("GetDevice monitor: {e}")))?
-            };
+            let dev: IMMDevice =
+                if device_id.eq_ignore_ascii_case("default") || device_id.is_empty() {
+                    enumerator
+                        .GetDefaultAudioEndpoint(eRender, eConsole)
+                        .map_err(|e| ObsError::Audio(format!("GetDefaultAudioEndpoint: {e}")))?
+                } else {
+                    let wide = HSTRING::from(device_id);
+                    enumerator
+                        .GetDevice(PCWSTR(wide.as_ptr()))
+                        .or_else(|_| enumerator.GetDefaultAudioEndpoint(eRender, eConsole))
+                        .map_err(|e| ObsError::Audio(format!("GetDevice monitor: {e}")))?
+                };
 
             let audio_client: IAudioClient = dev
                 .Activate(CLSCTX_ALL, None)

@@ -6,7 +6,7 @@ pub use remux::remux_to_mp4;
 pub use replay::{ReplayBufferConfig, ReplayBufferSession};
 
 use crossbeam_channel::{bounded, Sender};
-use named_pipe::WindowsNamedPipe;
+use named_pipe::{PipeCancelToken, WindowsNamedPipe};
 use obs_core::{ObsError, RecordState, RecordingStats, Result};
 use obs_encoder::{build_video_encoder_args, locate_ffmpeg, VideoEncodeParams};
 use obs_settings::RecordingFormat;
@@ -89,6 +89,7 @@ pub struct RecordingSession {
     encoded_frames: Arc<AtomicU64>,
     skipped_frames: Arc<AtomicU64>,
     child: Mutex<Option<Child>>,
+    pipe_cancels: Vec<Arc<PipeCancelToken>>,
     threads: Vec<JoinHandle<()>>,
     stderr_log: Arc<Mutex<String>>,
 }
@@ -261,7 +262,9 @@ impl RecordingSession {
         );
 
         let mut audio_txs = Vec::with_capacity(pipes.len());
+        let mut pipe_cancels = Vec::with_capacity(pipes.len());
         for (track_idx, mut pipe) in pipes {
+            pipe_cancels.push(pipe.cancel_token());
             let (tx, rx) = bounded::<Vec<u8>>(128);
             let r_aud = Arc::clone(&running);
             threads.push(
@@ -300,6 +303,7 @@ impl RecordingSession {
             encoded_frames,
             skipped_frames,
             child: Mutex::new(Some(child)),
+            pipe_cancels,
             threads,
             stderr_log,
         })
@@ -390,12 +394,39 @@ impl RecordingSession {
         self.video_tx.take();
         self.audio_txs.clear();
 
+        let mut child_status: Option<std::process::ExitStatus> = None;
+        if let Some(mut child) = self.child.lock().take() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(st)) => {
+                        child_status = Some(st);
+                        break;
+                    }
+                    Ok(None) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(25));
+                    }
+                    Ok(None) | Err(_) => {
+                        for c in &self.pipe_cancels {
+                            c.cancel();
+                        }
+                        let _ = child.kill();
+                        child_status = child.wait().ok();
+                        break;
+                    }
+                }
+            }
+        }
+
+        for c in &self.pipe_cancels {
+            c.cancel();
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
 
-        if let Some(mut child) = self.child.lock().take() {
-            let status = child.wait()?;
+        *self.state.lock() = RecordState::Stopped;
+        if let Some(status) = child_status {
             if !status.success() {
                 let err = self.stderr_log.lock().clone();
                 return Err(ObsError::Recorder(format!(
@@ -404,7 +435,6 @@ impl RecordingSession {
             }
         }
 
-        *self.state.lock() = RecordState::Stopped;
         let out_path = self.config.output_path.clone();
         if self.config.auto_remux_to_mp4 && self.config.format == RecordingFormat::Mkv {
             let mp4 = remux_to_mp4(&out_path, None)?;
@@ -447,5 +477,64 @@ mod tests {
         let path = expand_recording_filename(".", "%Q", RecordingFormat::Mkv);
         assert_eq!(path.extension().and_then(|s| s.to_str()), Some("mkv"));
         assert!(!path.file_stem().unwrap().is_empty());
+    }
+
+    #[test]
+    fn named_pipe_connect_unblocks_on_cancel() {
+        let mut pipe =
+            WindowsNamedPipe::create(&format!("obs-rust-cancel-test-{}", Uuid::new_v4())).unwrap();
+        let cancel = pipe.cancel_token();
+        let t0 = Instant::now();
+        let j = thread::spawn(move || pipe.connect());
+        thread::sleep(Duration::from_millis(40));
+        cancel.cancel();
+        let res = j.join().expect("thread panicked");
+        assert!(res.is_err(), "Cancelled connect should return Err");
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "Cancelled connect took too long: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    #[test]
+    fn recording_stop_does_not_hang_when_ffmpeg_fails_early() {
+        let tmp = std::env::temp_dir().join(format!("obs_rust_fail_stop_{}.mkv", Uuid::new_v4()));
+        let _ = fs::remove_file(&tmp);
+        let t0 = Instant::now();
+        let sess = RecordingSession::start(RecordingConfig {
+            output_path: tmp.clone(),
+            format: RecordingFormat::Mkv,
+            width: 320,
+            height: 240,
+            fps: 30,
+            sample_rate: 48000,
+            video_encoder: "nonexistent_encoder_xyz".to_string(),
+            audio_encoder: "aac".to_string(),
+            rate_control: "CBR".to_string(),
+            bitrate_kbps: 1500,
+            crf: 20,
+            preset: "speed".to_string(),
+            keyint_sec: 1,
+            audio_track_mask: 0b0000_0011,
+            audio_bitrate_kbps: 128,
+            color_space: ColorSpace::Rec709,
+            color_range: ColorRange::Partial,
+            auto_remux_to_mp4: false,
+        });
+        if let Ok(session) = sess {
+            thread::sleep(Duration::from_millis(80));
+            let res = session.stop();
+            assert!(
+                res.is_err(),
+                "Expected invalid encoder session stop to return Err"
+            );
+        }
+        let _ = fs::remove_file(&tmp);
+        assert!(
+            t0.elapsed() < Duration::from_secs(6),
+            "Early-failed FFmpeg stop hung: {:?}",
+            t0.elapsed()
+        );
     }
 }

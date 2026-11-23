@@ -19,6 +19,10 @@ macro_rules! define_id {
                 Self(id)
             }
 
+            pub const fn from_u128(v: u128) -> Self {
+                Self(Uuid::from_u128(v))
+            }
+
             pub fn parse_str(s: &str) -> Option<Self> {
                 Uuid::parse_str(s).ok().map(Self)
             }

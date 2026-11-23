@@ -2,7 +2,7 @@ pub mod backend;
 pub mod modals;
 pub mod theme;
 
-pub use backend::StudioBackend;
+pub use backend::{StudioBackend, UiNotice};
 
 use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use egui_dock::{DockArea, DockState, NodeIndex, Style as DockStyle, TabViewer};
@@ -110,8 +110,131 @@ pub struct ObsDesktopApp {
 
     inline_prompt: Option<InlinePromptKind>,
     inline_prompt_text: String,
-    status_toast: Option<String>,
+    pub(crate) status_toast: ToastQueue,
     last_theme: Option<(ThemeMode, f32)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToastItem {
+    pub id: u64,
+    pub message: String,
+    pub is_error: bool,
+    pub created_at: std::time::Instant,
+    pub duration: std::time::Duration,
+}
+
+#[derive(Default)]
+pub struct ToastQueue {
+    active: Option<ToastItem>,
+    queued: std::collections::VecDeque<ToastItem>,
+    last_backend_id: u64,
+    next_local_id: u64,
+}
+
+impl ToastQueue {
+    pub fn push_info(&mut self, msg: impl Into<String>) {
+        self.push_info_at(msg, std::time::Instant::now());
+    }
+
+    pub fn push_error(&mut self, msg: impl Into<String>) {
+        self.push_error_at(msg, std::time::Instant::now());
+    }
+
+    pub fn push_backend(&mut self, notices: Vec<UiNotice>) {
+        self.push_backend_at(notices, std::time::Instant::now());
+    }
+
+    fn push_info_at(&mut self, msg: impl Into<String>, now: std::time::Instant) {
+        self.next_local_id = self.next_local_id.saturating_add(1).max(1 << 62);
+        let id = self.next_local_id;
+        self.push_item_at(id, msg.into(), false, now);
+    }
+
+    fn push_error_at(&mut self, msg: impl Into<String>, now: std::time::Instant) {
+        self.next_local_id = self.next_local_id.saturating_add(1).max(1 << 62);
+        let id = self.next_local_id;
+        self.push_item_at(id, msg.into(), true, now);
+    }
+
+    fn push_backend_at(&mut self, notices: Vec<UiNotice>, now: std::time::Instant) {
+        for n in notices {
+            if n.id <= self.last_backend_id {
+                continue;
+            }
+            self.last_backend_id = n.id;
+            self.push_item_at(n.id, n.message, n.is_error, now);
+        }
+    }
+
+    fn push_item_at(&mut self, id: u64, message: String, is_error: bool, now: std::time::Instant) {
+        self.tick_at(now);
+        let duration = if is_error {
+            std::time::Duration::from_secs(8)
+        } else {
+            std::time::Duration::from_secs(5)
+        };
+        if let Some(cur) = &mut self.active {
+            if cur.message == message && cur.is_error == is_error {
+                cur.created_at = now;
+                return;
+            }
+        }
+        let item = ToastItem {
+            id,
+            message,
+            is_error,
+            created_at: now,
+            duration,
+        };
+        match &self.active {
+            None => self.active = Some(item),
+            Some(cur) if is_error && !cur.is_error => {
+                if let Some(prev) = self.active.replace(item) {
+                    if self.queued.len() >= 8 {
+                        self.queued.pop_front();
+                    }
+                    self.queued.push_back(prev);
+                }
+            }
+            Some(_) => {
+                if self.queued.len() >= 8 {
+                    self.queued.pop_front();
+                }
+                self.queued.push_back(item);
+            }
+        }
+    }
+
+    pub fn tick(&mut self) {
+        self.tick_at(std::time::Instant::now());
+    }
+
+    fn tick_at(&mut self, now: std::time::Instant) {
+        if let Some(cur) = &self.active {
+            if now.duration_since(cur.created_at) >= cur.duration {
+                self.active = self.queued.pop_front().map(|mut next| {
+                    next.created_at = now;
+                    next
+                });
+            }
+        }
+    }
+
+    pub fn dismiss(&mut self) {
+        let now = std::time::Instant::now();
+        self.active = self.queued.pop_front().map(|mut next| {
+            next.created_at = now;
+            next
+        });
+    }
+
+    pub fn current(&self) -> Option<&ToastItem> {
+        self.active.as_ref()
+    }
+
+    pub fn queued_count(&self) -> usize {
+        self.queued.len()
+    }
 }
 
 enum InlinePromptKind {
@@ -174,7 +297,7 @@ impl ObsDesktopApp {
             about_open: false,
             inline_prompt: None,
             inline_prompt_text: String::new(),
-            status_toast: None,
+            status_toast: ToastQueue::default(),
             last_theme: Some((mode, settings.accessibility.ui_scale)),
         }
     }
@@ -319,7 +442,7 @@ impl ObsDesktopApp {
                     if ui.button("Save Current UI Layout").clicked() {
                         if let Ok(j) = serde_json::to_string(&self.dock_state) {
                             self.backend.update_dock_layout(Some(j));
-                            self.status_toast = Some("Workspace dock layout saved.".to_string());
+                            self.status_toast.push_info("Workspace dock layout saved.");
                         }
                         ui.close_menu();
                     }
@@ -358,7 +481,7 @@ impl ObsDesktopApp {
                     }
                     if ui.button("Delete Current").clicked() {
                         if let Err(e) = self.backend.delete_profile(&active) {
-                            self.status_toast = Some(e);
+                            self.status_toast.push_error(e);
                         }
                         ui.close_menu();
                     }
@@ -384,7 +507,7 @@ impl ObsDesktopApp {
                             .pick_file()
                         {
                             if let Err(e) = self.backend.import_collection(&p) {
-                                self.status_toast = Some(e);
+                                self.status_toast.push_error(e);
                             }
                         }
                         ui.close_menu();
@@ -396,9 +519,10 @@ impl ObsDesktopApp {
                             .save_file()
                         {
                             if let Err(e) = self.backend.export_collection(&p) {
-                                self.status_toast = Some(e);
+                                self.status_toast.push_error(e);
                             } else {
-                                self.status_toast = Some(format!("Exported to {}", p.display()));
+                                self.status_toast
+                                    .push_info(format!("Exported to {}", p.display()));
                             }
                         }
                         ui.close_menu();
@@ -432,8 +556,24 @@ impl ObsDesktopApp {
                 });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(toast) = &self.status_toast {
-                        ui.colored_label(Color32::from_rgb(130, 195, 255), toast);
+                    if let Some(toast) = self.status_toast.current().cloned() {
+                        if ui
+                            .small_button("×")
+                            .on_hover_text("Dismiss notification")
+                            .clicked()
+                        {
+                            self.status_toast.dismiss();
+                        }
+                        let queued = self.status_toast.queued_count();
+                        if queued > 0 {
+                            ui.small(format!("(+{queued})"));
+                        }
+                        let color = if toast.is_error {
+                            Color32::from_rgb(255, 110, 110)
+                        } else {
+                            Color32::from_rgb(130, 195, 255)
+                        };
+                        ui.colored_label(color, &toast.message);
                     }
                 });
             });
@@ -587,7 +727,7 @@ impl ObsDesktopApp {
                     InlinePromptKind::CreateCollection => self.backend.create_collection(&txt),
                 };
                 if let Err(e) = res {
-                    self.status_toast = Some(e);
+                    self.status_toast.push_error(e);
                 }
             }
         } else if !keep_open {
@@ -623,9 +763,9 @@ impl eframe::App for ObsDesktopApp {
         self.backend.tick_frame(need_mv);
         self.sync_gpu_textures();
 
-        if let Some(notice) = self.backend.recent_notices().into_iter().last() {
-            self.status_toast = Some(notice);
-        }
+        self.status_toast.tick();
+        self.status_toast
+            .push_backend(self.backend.recent_notices());
 
         self.render_top_menu(ctx);
         self.render_status_bar(ctx);
@@ -1239,7 +1379,7 @@ impl<'a> ObsTabViewer<'a> {
             }
             if ui.button("-").on_hover_text("Remove Scene").clicked() {
                 if let Err(e) = self.app.backend.delete_scene(selected_id) {
-                    self.app.status_toast = Some(e);
+                    self.app.status_toast.push_error(e);
                 }
             }
             if ui.button("Dup").on_hover_text("Duplicate Scene").clicked() {
@@ -1504,7 +1644,20 @@ impl<'a> ObsTabViewer<'a> {
         });
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for src in col.sources.values().filter(|s| s.kind.has_audio()) {
+            let active_ids = col.active_audio_source_ids(None);
+            let mut audio_sources: Vec<&obs_scenes::SourceDefinition> = col
+                .sources
+                .values()
+                .filter(|s| s.kind.has_audio() && active_ids.contains(&s.id))
+                .collect();
+            audio_sources.sort_by_key(|s| {
+                (
+                    obs_scenes::global_audio_slot_order(s.id).unwrap_or(usize::MAX),
+                    s.name.to_lowercase(),
+                )
+            });
+
+            for src in audio_sources {
                 let meter = meters.get(&src.id).copied().unwrap_or(MeterReading {
                     peak_l_db: -60.0,
                     peak_r_db: -60.0,
@@ -1517,10 +1670,15 @@ impl<'a> ObsTabViewer<'a> {
 
                 let mut vol_mul = src.audio.volume_mul;
                 let mut muted = src.audio.muted;
+                let display_name = if obs_scenes::is_global_audio_source_id(src.id) {
+                    format!("[Global] {}", src.name)
+                } else {
+                    src.name.clone()
+                };
 
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(&src.name).strong());
+                        ui.label(RichText::new(&display_name).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("Filters").clicked() {
                                 open_filters_for = Some(src.id);
@@ -1652,7 +1810,7 @@ impl<'a> ObsTabViewer<'a> {
                 self.app.backend.start_streaming()
             };
             if let Err(e) = res {
-                self.app.status_toast = Some(e);
+                self.app.status_toast.push_error(e);
             }
         }
 
@@ -1677,12 +1835,14 @@ impl<'a> ObsTabViewer<'a> {
                 if recording {
                     match self.app.backend.stop_recording() {
                         Ok(p) => {
-                            self.app.status_toast = Some(format!("Saved: {}", p.display()));
+                            self.app
+                                .status_toast
+                                .push_info(format!("Saved: {}", p.display()));
                         }
-                        Err(e) => self.app.status_toast = Some(e),
+                        Err(e) => self.app.status_toast.push_error(e),
                     }
                 } else if let Err(e) = self.app.backend.start_recording() {
-                    self.app.status_toast = Some(e);
+                    self.app.status_toast.push_error(e);
                 }
             }
             if recording {
@@ -1697,7 +1857,7 @@ impl<'a> ObsTabViewer<'a> {
                     .clicked()
                 {
                     if let Err(e) = self.app.backend.pause_or_resume_recording() {
-                        self.app.status_toast = Some(e);
+                        self.app.status_toast.push_error(e);
                     }
                 }
             }
@@ -1727,7 +1887,7 @@ impl<'a> ObsTabViewer<'a> {
                     self.app.backend.start_replay_buffer()
                 };
                 if let Err(e) = res {
-                    self.app.status_toast = Some(e);
+                    self.app.status_toast.push_error(e);
                 }
             }
             if replay_active
@@ -1737,8 +1897,11 @@ impl<'a> ObsTabViewer<'a> {
                     .clicked()
             {
                 match self.app.backend.save_replay_buffer() {
-                    Ok(p) => self.app.status_toast = Some(format!("Replay saved: {}", p.display())),
-                    Err(e) => self.app.status_toast = Some(e),
+                    Ok(p) => self
+                        .app
+                        .status_toast
+                        .push_info(format!("Replay saved: {}", p.display())),
+                    Err(e) => self.app.status_toast.push_error(e),
                 }
             }
         });
@@ -1902,4 +2065,59 @@ fn fmt_ms(ms: u64) -> String {
     let m = (total_s % 3600) / 60;
     let s = total_s % 60;
     format!("{h:02}:{m:02}:{s:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn toast_queue_prioritizes_errors_and_deduplicates_backend_ids() {
+        let t0 = Instant::now();
+        let mut q = ToastQueue::default();
+
+        q.push_error_at("Critical disk write failure", t0);
+        // Subsequent info notice MUST NOT overwrite active error toast
+        q.push_info_at("Dock layout saved", t0 + Duration::from_secs(1));
+        assert!(q.current().unwrap().is_error);
+        assert_eq!(q.current().unwrap().message, "Critical disk write failure");
+        assert_eq!(q.queued_count(), 1);
+
+        // Backend notices deduplicate monotonic IDs and preserve error over info
+        q.push_backend_at(
+            vec![UiNotice {
+                id: 1,
+                message: "Old info".into(),
+                is_error: false,
+            }],
+            t0 + Duration::from_secs(2),
+        );
+        q.push_backend_at(
+            vec![UiNotice {
+                id: 1,
+                message: "Old info".into(),
+                is_error: false,
+            }],
+            t0 + Duration::from_secs(3),
+        );
+        assert_eq!(q.queued_count(), 2);
+
+        // Dismiss advances cleanly to queued info notices
+        q.dismiss();
+        assert_eq!(q.current().unwrap().message, "Dock layout saved");
+        assert!(!q.current().unwrap().is_error);
+
+        // Incoming error promotes immediately ahead of active info notice
+        q.push_error_at("Stream disconnected", t0 + Duration::from_secs(4));
+        assert!(q.current().unwrap().is_error);
+        assert_eq!(q.current().unwrap().message, "Stream disconnected");
+
+        // Expires after 8 seconds
+        q.tick_at(t0 + Duration::from_secs(13));
+        assert_ne!(
+            q.current().map(|t| t.message.as_str()),
+            Some("Stream disconnected")
+        );
+    }
 }

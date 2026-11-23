@@ -10,6 +10,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiNotice {
+    pub id: u64,
+    pub message: String,
+    pub is_error: bool,
+}
+
 /// Interface bridging `obs-ui` to `ObsEngine` (`crates/app`) cleanly without circular dependencies.
 pub trait StudioBackend: Send + Sync {
     fn attach_wgpu(
@@ -31,7 +38,8 @@ pub trait StudioBackend: Send + Sync {
     fn stats(&self) -> EngineStats;
     fn audio_meters(&self) -> HashMap<SourceId, MeterReading>;
     fn source_errors(&self) -> HashMap<SourceId, String>;
-    fn recent_notices(&self) -> Vec<String>;
+    fn recent_notices(&self) -> Vec<UiNotice>;
+    fn has_active_output(&self) -> bool;
 
     fn settings(&self) -> AppSettings;
     fn apply_settings(&self, settings: AppSettings) -> Result<(), String>;
